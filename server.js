@@ -14,6 +14,9 @@ const API_SECRET = process.env.API_SECRET || "claude-agents-secret-2026";
 const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || "/root/.claude/.credentials.json";
 const HOST_IP = process.env.HOST_IP || "0.0.0.0";
 const DEPLOYS_DIR = process.env.DEPLOYS_DIR || "/opt/deploys";
+const CLOUD_API_URL = process.env.CLOUD_API_URL || "http://127.0.0.1:9090";
+const CLOUD_API_SECRET = process.env.CLOUD_API_SECRET || "agentify-cloud-secret-2026";
+const DOMAIN = process.env.DOMAIN || "agentsfy.cc";
 const IMAGE_NAME = "claude-agent:latest";
 const CONTAINER_PREFIX = "claude-agent-";
 const PORT_RANGE_START = 9000;
@@ -97,12 +100,40 @@ async function containerExecStream(container, command, onData) {
   });
 }
 
+// --- Helper: register subdomain via Container Manager API ---
+async function registerSubdomain(subdomain, containerName, port, ip) {
+  try {
+    const http = require("http");
+    const data = JSON.stringify({ subdomain, container_name: containerName, port, ip: ip || undefined });
+    return new Promise((resolve, reject) => {
+      const url = new URL(CLOUD_API_URL + "/subdomains");
+      const req = http.request({
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-api-key": CLOUD_API_SECRET },
+      }, (res) => {
+        let body = "";
+        res.on("data", (c) => body += c);
+        res.on("end", () => resolve(JSON.parse(body)));
+      });
+      req.on("error", reject);
+      req.write(data);
+      req.end();
+    });
+  } catch (err) {
+    console.error("Subdomain registration failed:", err.message);
+    return null;
+  }
+}
+
 // --- Build the system prompt injection for publish/port awareness ---
-function buildPublishInstructions(id, agentPort, hostIp) {
+function buildPublishInstructions(id, agentPort, hostIp, subdomain) {
   return `
 
-IMPORTANT - Publishing capabilities:
-You have two ways to make your work accessible externally:
+IMPORTANT - Publishing & Deploy capabilities:
+You have THREE ways to make your work accessible externally:
 
 1. STATIC FILES (websites, landing pages, HTML files):
    Save files to /publish/ directory. They are automatically served at:
@@ -114,8 +145,19 @@ You have two ways to make your work accessible externally:
    It will be accessible externally at: http://${hostIp}:${agentPort}/
    Example: express app listening on port ${agentPort} -> accessible at http://${hostIp}:${agentPort}/
 
-Always prefer /publish/ for static content. Use the dynamic port only when you need a running server.
-When you create something accessible, always tell the user the full URL where they can see it.
+3. PRODUCTION DEPLOY with subdomain (PREFERRED for final delivery):
+   Your subdomain is: https://${subdomain}.${DOMAIN}
+   To deploy a static site: save files to /publish/, then run this command to register:
+     curl -s -X POST http://127.0.0.1:9090/subdomains -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" -d '{"subdomain":"${subdomain}","container_name":"${CONTAINER_PREFIX}${id}","port":${agentPort},"ip":"127.0.0.1"}'
+   To deploy a dynamic app: start your server on port ${agentPort}, then run the same curl command above.
+   After registering, the app will be live at: https://${subdomain}.${DOMAIN}
+
+   For static sites, install and start serve first:
+     npm install -g serve && serve /publish -l ${agentPort} -s &
+   Then register the subdomain with the curl command above.
+
+When you deploy something, ALWAYS tell the user the https://${subdomain}.${DOMAIN} URL.
+Prefer option 3 (production deploy) when the user asks to deploy or publish something for real.
 `;
 }
 
@@ -179,8 +221,11 @@ app.post("/agents", auth, async (req, res) => {
     const verify = await containerExec(container, 'echo "respond with exactly: AGENT_READY" | claude -p 2>&1');
     const isReady = verify.includes("AGENT_READY");
 
+    // Generate subdomain from agent name
+    const subdomain = (name || "agent-" + id).toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
+
     // Build combined system prompt with publish instructions
-    const publishInstructions = buildPublishInstructions(id, agentPort, hostIp);
+    const publishInstructions = buildPublishInstructions(id, agentPort, hostIp, subdomain);
     const fullSystemPrompt = (system_prompt || "") + publishInstructions;
 
     const agent = {
@@ -191,8 +236,10 @@ app.post("/agents", auth, async (req, res) => {
       status: isReady ? "ready" : "auth_pending",
       system_prompt: fullSystemPrompt,
       port: agentPort,
+      subdomain,
       publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
       dynamic_url: "http://" + hostIp + ":" + agentPort + "/",
+      production_url: "https://" + subdomain + "." + DOMAIN,
       created_at: new Date().toISOString(),
       tasks_completed: 0,
     };
