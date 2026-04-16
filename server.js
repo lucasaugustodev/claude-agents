@@ -229,56 +229,59 @@ async function injectCredentials(container) {
 
 // --- Build publish instructions ---
 function buildPublishInstructions(groupId, agentPort, subdomain) {
-  const hostIp = getHostIp();
-  const containerName = GROUP_PREFIX + groupId;
   return `
 
-=== AGENTSFY DEPLOY SYSTEM ===
+=== AGENTSFY TOOLS ===
 
-You are inside a Docker container named "${containerName}" that is part of the Agentsfy platform.
-All agents in this group share the /workspace filesystem and /publish directory.
-Your dedicated port is ${agentPort}.
+You are inside a Docker container in the Agentsfy platform. All agents in this group share /workspace.
+Your dedicated port for running apps is ${agentPort}.
 
-WHEN YOU BUILD AN APP OR WEBSITE, YOU MUST FOLLOW THIS FULL DEPLOY PROCESS:
+READ YOUR CONTEXT FIRST:
+  cat /workspace/shared/context.json
+  # Contains: api_url, api_token, conversation_id, user_id, group_members
 
-STEP 1 - Build your app
-  Save files to /publish/ for static sites, or create a server in /workspace.
+USER CREDENTIALS (API keys, tokens):
+  cat /workspace/shared/credentials.json
+  # Format: {"bitrix_api_key": "...", "github_token": "...", ...}
+  NEVER hardcode secrets. Always read from here.
 
-STEP 2 - Start serving
-  For static sites:
-    npm install -g serve 2>/dev/null; serve /publish -l ${agentPort} -s &
-  For Node.js apps:
-    Start your server listening on port ${agentPort}
+=== INVOKING TOOLS ===
 
-STEP 3 - Register the app (MANDATORY)
-  This makes the app appear on the user's Apps page in Agentsfy:
-    curl -s -X POST http://127.0.0.1:9090/containers/${containerName}/apps \\
-      -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" \\
-      -d '{"app_name":"${subdomain}","port":${agentPort},"command":"serve /publish -l ${agentPort} -s"}'
+To use a platform tool, call:
+  API_URL=$(jq -r .api_url /workspace/shared/context.json)
+  API_TOKEN=$(jq -r .api_token /workspace/shared/context.json)
+  CONV_ID=$(jq -r .conversation_id /workspace/shared/context.json)
 
-STEP 4 - Register subdomain (MANDATORY)
-  This gives the app a production HTTPS URL:
-    curl -s -X POST http://127.0.0.1:9090/subdomains \\
-      -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" \\
-      -d '{"subdomain":"${subdomain}","container_name":"${containerName}","port":${agentPort},"ip":"127.0.0.1"}'
+  curl -s -X POST "$API_URL/api/tools/<tool_name>" \\
+    -H "x-api-token: $API_TOKEN" \\
+    -H "Content-Type: application/json" \\
+    -d '{"conversation_id":"'$CONV_ID'", ...args}'
 
-STEP 5 - Confirm to the user
-  Production URL: https://${subdomain}.${DOMAIN}
-  ALWAYS tell the user this URL after deploying.
+Discover all tools with schemas:
+  curl -s "$API_URL/api/tools" | jq
 
-IMPORTANT RULES:
-- NEVER skip steps 3 and 4. Without them the app won't appear in the platform.
-- If the user asks to "deploy", "publish", or "put online", follow ALL 5 steps.
-- Use /workspace/shared/ for files that other agents in this group need to access.
-- Your personal workspace is /workspace/<your-name> but you can read/write anywhere in /workspace.
+=== KEY TOOLS ===
 
-=== CREDENTIALS ===
-User API keys and credentials are stored in /workspace/shared/credentials.json
-Read this file when you need API keys, tokens, or secrets for external services (Bitrix, GitHub, etc).
-Format: {"key_name": "key_value", ...}
-NEVER hardcode credentials. Always read from this file.
+- schedule_create  — recurring task (args: cron, name, prompt)
+- schedule_list    — list schedules in this conversation
+- deploy_app       — publish app from /publish to production subdomain
+- credential_get   — fetch a user credential by name
+- memory_search    — search user memories semantically
+- memory_store     — save a memory
+- project_file_read / project_file_write — read/write files in user's cloud container
+- github_create_repo — create a GitHub repo (uses github_token credential)
 
-=== END SYSTEM ===
+WHEN TO USE EACH:
+- User asks for recurring task ("a cada X", "diariamente") → schedule_create
+- User asks to "deploy" / "publish" → deploy_app
+- You need an API key → credential_get
+- Building an app → save to /publish, then deploy_app
+
+=== RULES ===
+
+- Actually CALL the tools, do not fake responses or invent IDs.
+- Every tool returns JSON — check it before confirming success to the user.
+- The schedule runs inside THIS group container — your team agents execute the task when it fires.
 `;
 }
 
