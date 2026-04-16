@@ -1,4 +1,11 @@
 node_modules/
 .credentials.json
 .env
+.env.local
+.env.*.local
 *.log
+dist/
+build/
+.DS_Store
+Thumbs.db
+*.tmp
