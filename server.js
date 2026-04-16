@@ -583,12 +583,28 @@ END_DELEGATE
 
 Schedule recurring tasks:
 SCHEDULE:
-{"cron": "*/5 * * * *", "name": "Name", "prompt": "what to do each run"}
+{"cron": "*/5 * * * *", "name": "Name", "prompt": "Plain-language task description in Portuguese"}
 END_SCHEDULE
+
+CRITICAL — SCHEDULE.prompt rules:
+- Must be plain human-language describing what to do each run.
+- Example GOOD: "Busque notícias novas do Brasil e envie as manchetes pro Lucas Augusto no Bitrix."
+- Example BAD (DO NOT DO THIS): prompt containing "DELEGATE:", "END_DELEGATE", or JSON arrays.
+- The scheduler will feed this prompt back to YOU (orchestrator) on each run, and you will delegate from scratch. So the prompt should READ like a user request, not like a DELEGATE block.
 
 Cron examples: */5 * * * * (5 min), 0 * * * * (hourly), 0 9 * * * (daily 9am).
 
 For schedules: just output the block + ONE sentence "Agendei X a cada Y". Nothing else.
+
+## SEQUENTIAL TASKS
+
+When one agent depends on another's output (e.g. Web Researcher writes a file, then Bitrix reads it), delegate SEQUENTIALLY — wait for the first to finish before running the second. You control this by calling delegate multiple times in separate turns, OR by putting them in SEQUENCE in a single DELEGATE:
+
+DELEGATE_SEQUENTIAL:
+[{"agent_name": "A", "task": "..."}, {"agent_name": "B", "task": "..."}]
+END_DELEGATE_SEQUENTIAL
+
+Regular DELEGATE runs in parallel — only use when tasks are independent.
 
 ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}
 ${memoryContext}`;
@@ -609,19 +625,23 @@ ${memoryContext}`;
 
     sendEvent("orchestrate.plan_ready", { plan: (plan || "").trim() });
 
-    // Step 2: Parse delegations
+    // Step 2: Parse delegations — sequential first, then parallel
+    const seqMatch = plan.match(/DELEGATE_SEQUENTIAL:\s*\n?\s*(\[[\s\S]*?\])\s*\n?\s*END_DELEGATE_SEQUENTIAL/);
     const delegateMatch = plan.match(/DELEGATE:\s*\n?\s*(\[[\s\S]*?\])\s*\n?\s*END_DELEGATE/);
     let delegations = [];
-    if (delegateMatch) {
+    let sequential = false;
+    if (seqMatch) {
+      try { delegations = JSON.parse(seqMatch[1]); sequential = true; } catch (_) {}
+    } else if (delegateMatch) {
       try { delegations = JSON.parse(delegateMatch[1]); } catch (_) {}
     }
 
-    // Step 3: Execute delegated tasks in parallel
+    // Step 3: Execute delegated tasks (parallel or sequential)
     const results = [];
     if (delegations.length > 0) {
-      sendEvent("orchestrate.delegating", { tasks: delegations.map(d => ({ agent_name: d.agent_name, task: d.task.slice(0, 100) })) });
+      sendEvent("orchestrate.delegating", { mode: sequential ? "sequential" : "parallel", tasks: delegations.map(d => ({ agent_name: d.agent_name, task: d.task.slice(0, 100) })) });
 
-      const taskPromises = delegations.map(async (d) => {
+      const runOne = async (d) => {
         const member = group.members.find(m => m.name === d.agent_name);
         if (!member) return { agent_name: d.agent_name, output: "Agent not found in group", error: true };
 
@@ -657,10 +677,17 @@ ${memoryContext}`;
           sendEvent("agent.error", { agent_name: d.agent_name, error: err.message });
           return { agent_name: d.agent_name, output: "Error: " + err.message, error: true };
         }
-      });
+      };
 
-      const settled = await Promise.all(taskPromises);
-      results.push(...settled);
+      if (sequential) {
+        for (const d of delegations) {
+          const r = await runOne(d);
+          results.push(r);
+        }
+      } else {
+        const settled = await Promise.all(delegations.map(runOne));
+        results.push(...settled);
+      }
     }
 
     // Step 4: Synthesize results
