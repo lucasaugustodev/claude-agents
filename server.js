@@ -180,6 +180,34 @@ async function containerExecStream(container, command, onData) {
   });
 }
 
+// --- Retry wrapper for Claude Code execution (retries on 500/529/overloaded) ---
+const RETRYABLE_PATTERNS = ["API Error: 500", "API Error: 529", "Internal server error", "overloaded", "rate_limit"];
+const MAX_RETRIES = 3;
+
+async function containerExecStreamWithRetry(container, command, onData) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const chunks = [];
+    const wrappedOnData = (text) => {
+      chunks.push(text);
+      if (onData) onData(text);
+    };
+
+    const output = await containerExecStream(container, command, wrappedOnData);
+    const outputStr = String(output);
+
+    const isRetryable = RETRYABLE_PATTERNS.some(p => outputStr.includes(p));
+    if (!isRetryable || attempt === MAX_RETRIES) {
+      return output;
+    }
+
+    // Retryable error — wait with exponential backoff and retry
+    const waitSec = attempt * 10;
+    console.log("[Retry] Attempt " + attempt + "/" + MAX_RETRIES + " failed with retryable error, waiting " + waitSec + "s...");
+    if (onData) onData("\n[Retrying in " + waitSec + "s due to API error... attempt " + (attempt + 1) + "/" + MAX_RETRIES + "]\n");
+    await new Promise(r => setTimeout(r, waitSec * 1000));
+  }
+}
+
 // --- Inject credentials into a container ---
 async function injectCredentials(container) {
   const credentials = fs.readFileSync(CREDENTIALS_PATH, "utf8");
@@ -415,7 +443,7 @@ app.post("/groups/:id/task", auth, async (req, res) => {
 
     const cmd = buildClaudeCmd(prompt, sysPrompt, { model, max_turns, allowedTools });
 
-    const fullOutput = await containerExecStream(container, cmd, (chunk) => {
+    const fullOutput = await containerExecStreamWithRetry(container, cmd, (chunk) => {
       sendEvent("task.output", { task_id: taskId, agent_name: agent_name || "default", text: chunk });
     });
 
@@ -492,7 +520,7 @@ ${memoryContext}`;
 
     // Step 1: Ask orchestrator to plan
     const planCmd = buildClaudeCmd(prompt, orchestratorPrompt, {});
-    const plan = await containerExecStream(container, planCmd, (chunk) => {
+    const plan = await containerExecStreamWithRetry(container, planCmd, (chunk) => {
       sendEvent("orchestrate.planning", { text: chunk });
     });
 
@@ -527,7 +555,7 @@ ${memoryContext}`;
             allowedTools: ["Bash", "Write", "Edit", "Read"],
           });
 
-          const output = await containerExecStream(container, taskCmd, (chunk) => {
+          const output = await containerExecStreamWithRetry(container, taskCmd, (chunk) => {
             sendEvent("agent.output", { agent_name: d.agent_name, text: chunk });
           });
 
@@ -554,7 +582,7 @@ ${memoryContext}`;
 
       const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Synthesize team results concisely. Include all URLs and deliverables.", {});
 
-      const synthesis = await containerExecStream(container, synthesisCmd, (chunk) => {
+      const synthesis = await containerExecStreamWithRetry(container, synthesisCmd, (chunk) => {
         sendEvent("orchestrate.synthesis", { text: chunk });
       });
 
@@ -719,7 +747,7 @@ app.post("/agents/:id/task", auth, async (req, res) => {
     const taskId = uuidv4().slice(0, 8);
     sendEvent("task.started", { task_id: taskId, agent_id: agent.id, prompt });
     const cmd = buildClaudeCmd(prompt, system_prompt || agent.system_prompt, { model, max_turns, allowedTools });
-    const fullOutput = await containerExecStream(container, cmd, (chunk) => {
+    const fullOutput = await containerExecStreamWithRetry(container, cmd, (chunk) => {
       sendEvent("task.output", { task_id: taskId, text: chunk });
     });
     agent.tasks_completed++;
