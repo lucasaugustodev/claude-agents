@@ -1,58 +1,83 @@
 # Claude Agents
 
-Managed Agents platform that runs Claude Code instances inside Docker containers, pre-authenticated and ready to receive tasks via a REST API with SSE streaming.
+Managed Agents platform for orchestrating Claude Code instances inside Docker containers. Pre-authenticated, tool-calling via MCP, with a REST API and SSE streaming.
 
-Two modes of operation:
+Built for the [Agentsfy](https://agentsfy.cc) platform.
 
-- **Individual Agents** — 1 container per agent, full isolation
-- **Groups** (recommended) — 1 container shared by N agents with a shared `/workspace` filesystem and built-in orchestrator that delegates tasks, coordinates parallel work, and synthesizes results
-
-## How it works
-
-### Groups (recommended)
+## Architecture
 
 ```
-Client
-  |
-  |  POST /groups              → Create group (1 container, N agents)
-  |  POST /groups/:id/orchestrate → Send request (orchestrator delegates + synthesizes)
-  v
-Claude Agents API (Node.js)
-  |
-  |  dockerode → Docker Engine
-  |  1 container for the whole group
-  |  Shared /workspace filesystem
-  |  Orchestrator plans → delegates to agents → synthesizes
-  v
-Docker Container (shared)
-  |  - Node.js 20 + Claude Code CLI
-  |  - 4GB RAM, shared CPU
-  |  - /workspace (all agents read/write)
-  |  - /publish (auto-served static files)
-  |  - Dedicated port (dynamic apps)
-  v
-Claude API (Anthropic)
+┌─ claude-agents API (Node, port 8200) ───────────────────────┐
+│  + MCP callback server (port 8201)                          │
+│  + Tool registry (delegate_agent, ask_user, finish)         │
+└────┬──────────────────────────────────────────────────────┬─┘
+     │                                                      │
+     │ dockerode                                     HTTP callback
+     ▼                                                      ▲
+┌─ Docker Container (1 per group) ────────────────────────────┐
+│  Runs as non-root user `agent` (uid 1001)                   │
+│  ┌─ Orchestrator (claude -p --bare --mcp-config ...) ─┐     │
+│  │   Tool-calls delegate_agent(member, task) via MCP  │     │
+│  │   Loops until finish() or end_turn                 │     │
+│  └────────────────────────────────────────────────────┘     │
+│  ┌─ MCP stdio server (node /opt/mcp/mcp-server.js) ──┐      │
+│  │   Spawned by Claude CLI via --mcp-config          │      │
+│  │   Forwards tool calls via HTTP to backend         │      │
+│  └───────────────────────────────────────────────────┘      │
+│  ┌─ Subagents (spawned on delegate_agent via exec) ─┐       │
+│  │   claude -p --bare with each member's prompt     │       │
+│  │   Share /workspace filesystem                    │       │
+│  └──────────────────────────────────────────────────┘       │
+│  /workspace  — shared filesystem across all agents          │
+│  /publish    — auto-served static files                     │
+│  /workspace/shared/context.json     — api_url, api_token    │
+│  /workspace/shared/credentials.json — user API secrets      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Individual Agents (legacy)
+## Key Design
 
-```
-Client → POST /agents → 1 container per agent → Claude API
-```
+### Tool-calling via MCP (no regex)
 
-## Authentication — How Claude Code CLI Auth Works
+The orchestrator does not output `DELEGATE:` blocks. It invokes real tools through the Model Context Protocol:
 
-Claude Code does **not** use a standard API key (`sk-ant-...`). It uses an **OAuth 2.0 flow** with access + refresh tokens. Understanding this was essential to making headless/remote deployment work.
+| Tool | Description |
+|------|-------------|
+| `delegate_agent(agent_name, task)` | Run a team member, return their output |
+| `ask_user(question)` | Ask the user a question and signal end-of-turn |
+| `finish(summary)` | Mark orchestration complete |
 
-### The OAuth Flow
+Claude CLI natively understands these via `--mcp-config`. The MCP stdio server runs inside the container and forwards each tool call to the backend over HTTP, which spawns the requested subagent and streams its output back.
 
-When you run `claude` and authenticate through the browser, the CLI stores credentials at:
+### `--bare` mode for speed
 
-```
-~/.claude/.credentials.json
-```
+All Claude CLI calls use `--bare`, which skips hooks, plugins, LSP, CLAUDE.md discovery, and auto-memory. Combined with exporting the OAuth token as `ANTHROPIC_API_KEY`, cold start drops from ~4.7s to ~1.8s.
 
-The file looks like this:
+**Measured end-to-end latency:**
+
+| Flow | Before | After |
+|------|--------|-------|
+| Cold start | 4.7s | **1.8s** |
+| Simple delegation (orchestrator + 1 subagent) | 60-120s | **~20s** |
+| Sequential 2-agent flow | 150-240s | **~40s** |
+
+### Stream-json parsing
+
+Claude CLI runs with `--output-format stream-json --verbose`. We parse the stream in real time:
+
+- `assistant` blocks → `text` chunks (streamed to user) and `tool_use` blocks (emitted as events)
+- `user` blocks with `tool_result` → emitted as events
+- `result` block → authoritative final text
+
+The final text from `result` is preferred over concatenating streamed chunks (which can duplicate when Claude emits multiple assistant turns).
+
+### Retry with exponential backoff
+
+`containerExecStreamWithRetry` detects `API Error: 500`, `529`, `overloaded`, `rate_limit`, and retries 3 times with 10s/20s/30s backoff. Notifies the user that a retry is in progress.
+
+## Authentication — Claude Code CLI OAuth
+
+Claude Code does **not** use standard API keys. It uses OAuth with access + refresh tokens stored at `~/.claude/.credentials.json`:
 
 ```json
 {
@@ -66,56 +91,25 @@ The file looks like this:
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `accessToken` | Short-lived OAuth Access Token (prefix `sk-ant-oat01-`) |
-| `refreshToken` | Long-lived Refresh Token (prefix `sk-ant-ort01-`) |
-| `expiresAt` | Token expiry in milliseconds epoch |
-| `scopes` | Authorized scopes for the token |
-| `subscriptionType` | Plan type (`free`, `pro`, `max`) |
+To inject these credentials into every container, we copy the host's credentials file on container startup, placed at `/home/agent/.claude/.credentials.json`. Claude CLI reads them and uses the `refreshToken` to obtain fresh `accessToken`s as they expire.
 
-### Key Discovery: Required API Headers
+**Trick to use `--bare`:** `--bare` mode requires `ANTHROPIC_API_KEY` instead of reading the OAuth file. Since `sk-ant-oat01-*` tokens are accepted by the Messages API, we export the `accessToken` as `ANTHROPIC_API_KEY` at runtime:
 
-The CLI hits the standard Anthropic Messages API, but requires specific headers that are **not documented**. Without all of them, the API returns `400 Bad Request`:
-
-```
-POST https://api.anthropic.com/v1/messages?beta=true
-
-Headers:
-  authorization: Bearer sk-ant-oat01-...
-  anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14
-  anthropic-dangerous-direct-browser-access: true
-  anthropic-version: 2023-06-01
-  user-agent: claude-cli/<version> (external, cli)
-  x-app: cli
-  content-type: application/json
+```bash
+export ANTHROPIC_API_KEY="$(jq -r .claudeAiOauth.accessToken /home/agent/.claude/.credentials.json)"
+claude -p --bare ...
 ```
 
-The body also requires:
-- A **system** array with a billing header: `x-anthropic-billing-header: cc_version=<ver>; cc_entrypoint=cli;`
-- A `metadata.user_id` field with device and account identifiers
-- A `thinking` block when using the interleaved-thinking beta
-
-### How We Use This
-
-Instead of reverse-engineering the full API call, we use a simpler approach: **copy the credentials file** and let Claude Code CLI handle the rest. The CLI reads `~/.claude/.credentials.json`, uses the `refreshToken` to obtain new `accessToken`s when they expire, and manages the full lifecycle.
-
-The workflow:
-1. Authenticate Claude Code on the host machine (normal browser flow, one-time)
-2. Read `~/.claude/.credentials.json` from host
-3. Inject it into each Docker container via base64 encoding
-4. Claude Code inside the container works immediately — no browser needed
-
-This was discovered by intercepting Claude Code's HTTP calls using a Node.js `--require` interceptor. Full research: [cli-api-internals](https://github.com/lucasaugustodev/cli-api-internals).
+Full research on the internal API: [cli-api-internals](https://github.com/lucasaugustodev/cli-api-internals).
 
 ## Setup
 
 ### Prerequisites
 
 - Linux server (Ubuntu 22.04+)
-- Docker installed
+- Docker
 - Node.js 20+
-- Claude Code authenticated on the host (`~/.claude/.credentials.json` must exist)
+- Claude Code authenticated on host (`~/.claude/.credentials.json`)
 
 ### Install
 
@@ -123,21 +117,24 @@ This was discovered by intercepting Claude Code's HTTP calls using a Node.js `--
 git clone https://github.com/lucasaugustodev/claude-agents.git
 cd claude-agents
 
-# Build the agent Docker image
+# Build the Docker image
 docker build -t claude-agent:latest .
 
-# Install dependencies
+# Allow containers to reach host services through docker0 bridge
+sudo ./setup-iptables.sh
+
+# Install deps
 npm install
 
 # Configure
 cp .env.example .env
-# Edit .env with your API_SECRET
+# edit API_SECRET, CREDENTIALS_PATH
 
-# Start
+# Run
 node server.js
 ```
 
-### Systemd Service
+### Systemd
 
 ```ini
 [Unit]
@@ -150,248 +147,155 @@ Type=simple
 WorkingDirectory=/opt/claude-agents
 ExecStart=/usr/bin/node /opt/claude-agents/server.js
 Restart=always
-RestartSec=5
-Environment=PORT=3100
+Environment=PORT=8200
+Environment=MCP_CALLBACK_PORT=8201
 Environment=API_SECRET=your-secret-here
 Environment=CREDENTIALS_PATH=/root/.claude/.credentials.json
+Environment=MCP_HOST_FROM_CONTAINER=172.17.0.1
+Environment=DEFAULT_MODEL=claude-opus-4-7
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-## API Reference
+### iptables
 
-All endpoints (except `/health`) require the `x-api-key` header.
-
-### `GET /health`
-
-Health check. No auth required.
+Containers need to reach host services over the docker0 bridge:
 
 ```bash
-curl http://localhost:3100/health
+iptables -I INPUT -i docker0 -p tcp --dport 4001 -j ACCEPT  # Agentify API
+iptables -I INPUT -i docker0 -p tcp --dport 8201 -j ACCEPT  # MCP callback
+iptables -I INPUT -i docker0 -p tcp --dport 8100 -j ACCEPT  # MemPalace
+iptables -I INPUT -i docker0 -p tcp --dport 9090 -j ACCEPT  # Container Manager
 ```
 
-```json
-{"status": "ok", "service": "claude-agents", "agents_count": 2, "uptime": 3600}
-```
+Use `setup-iptables.sh` in the repo.
 
-### `POST /agents`
-
-Create a new agent. Spins up a Docker container, installs credentials, and verifies Claude Code works.
-
-```bash
-curl -X POST http://localhost:3100/agents \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-secret" \
-  -d '{
-    "name": "my-agent",
-    "system_prompt": "You are a senior Python developer."
-  }'
-```
-
-Response:
-
-```json
-{
-  "id": "cf886e56",
-  "name": "my-agent",
-  "container_name": "claude-agent-cf886e56",
-  "container_id": "7670c9231d...",
-  "status": "ready",
-  "system_prompt": "You are a senior Python developer.",
-  "created_at": "2026-04-16T04:43:45.122Z",
-  "tasks_completed": 0
-}
-```
-
-### `GET /agents`
-
-List all agents with Docker state.
-
-### `GET /agents/:id`
-
-Get details for a specific agent.
-
-### `DELETE /agents/:id`
-
-Stop and remove the agent's container.
-
-```bash
-curl -X DELETE http://localhost:3100/agents/cf886e56 \
-  -H "x-api-key: your-secret"
-```
-
-### `POST /agents/:id/task`
-
-Send a task to an agent. Returns **Server-Sent Events (SSE)** stream.
-
-```bash
-curl -N -X POST http://localhost:3100/agents/cf886e56/task \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-secret" \
-  -d '{
-    "prompt": "Create a REST API in Python with FastAPI that has CRUD for users",
-    "max_turns": "10",
-    "allowedTools": ["Bash", "Write", "Edit", "Read"]
-  }'
-```
-
-**SSE Events:**
-
-| Event | Description |
-|-------|-------------|
-| `task.started` | Task accepted, includes task_id |
-| `task.executing` | Command being executed in container |
-| `task.output` | Streaming output chunks from Claude |
-| `task.completed` | Task finished, includes full output |
-| `task.error` | Error occurred |
-
-**Body parameters:**
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `prompt` | Yes | The task/prompt to send |
-| `system_prompt` | No | Override agent's system prompt |
-| `model` | No | Claude model to use |
-| `max_turns` | No | Max agentic turns |
-| `allowedTools` | No | Array of allowed tools (e.g. `["Bash", "Write"]`) |
-
-### `POST /agents/:id/conversation`
-
-Multi-turn conversation using Claude Code's `--resume` flag.
-
-```bash
-curl -N -X POST http://localhost:3100/agents/cf886e56/conversation \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-secret" \
-  -d '{
-    "prompt": "What files did you create in the last task?",
-    "session_id": "previous-session-id"
-  }'
-```
-
-### `POST /agents/:id/exec`
-
-Run a raw shell command inside the agent's container.
-
-```bash
-curl -X POST http://localhost:3100/agents/cf886e56/exec \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-secret" \
-  -d '{"command": "ls -la /workspace"}'
-```
-
-### `POST /agents/:id/upload`
-
-Upload a file to the agent's container.
-
-```bash
-curl -X POST http://localhost:3100/agents/cf886e56/upload \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-secret" \
-  -d '{
-    "path": "/workspace/config.json",
-    "content": "{\"key\": \"value\"}"
-  }'
-```
-
-## Groups API Reference
+## Groups API
 
 ### `POST /groups`
 
-Create a group — 1 Docker container with N agents sharing `/workspace`.
+Create a group — 1 Docker container, N agents, shared `/workspace`.
 
 ```bash
-curl -X POST http://localhost:3100/groups \
-  -H "Content-Type: application/json" \
+curl -X POST http://localhost:8200/groups \
   -H "x-api-key: your-secret" \
   -d '{
     "name": "web-team",
-    "description": "Frontend + Backend team",
     "members": [
-      {"name": "frontend", "role": "Frontend Developer", "system_prompt": "You are a frontend expert."},
-      {"name": "backend", "role": "Backend Developer", "system_prompt": "You are a Node.js expert."}
+      {"name": "Writer", "role": "writer", "system_prompt": "You write things."},
+      {"name": "Reviewer", "role": "reviewer", "system_prompt": "You review things."}
     ]
   }'
 ```
 
-Response includes `publish_url`, `dynamic_url`, and `production_url` (subdomain).
+Response includes `port`, `subdomain`, `publish_url`, `dynamic_url`, `production_url`.
 
 ### `POST /groups/:id/orchestrate`
 
-Send a request to the group. The orchestrator analyzes, delegates to agents in parallel, and synthesizes results. Returns SSE stream.
+Send a request to the group. Returns SSE stream.
 
 ```bash
-curl -N -X POST http://localhost:3100/groups/abc123/orchestrate \
-  -H "Content-Type: application/json" \
+curl -N -X POST http://localhost:8200/groups/abc123/orchestrate \
   -H "x-api-key: your-secret" \
-  -d '{"prompt": "Create a landing page with a REST API backend"}'
+  -d '{
+    "prompt": "Writer writes a poem about rain, then Reviewer reads it and gives feedback",
+    "user_id": "uuid-of-user"
+  }'
 ```
 
-**SSE Events:**
+**SSE events:**
 
-| Event | Description |
-|-------|-------------|
-| `orchestrate.started` | Request received |
-| `orchestrate.planning` | Orchestrator analyzing and planning (streaming) |
-| `orchestrate.plan_ready` | Plan complete, includes DELEGATE block |
-| `orchestrate.delegating` | Tasks being dispatched to agents |
-| `agent.started` | Agent began working on task |
-| `agent.output` | Streaming output from agent |
-| `agent.completed` | Agent finished task |
-| `orchestrate.synthesis` | Orchestrator synthesizing results |
-| `orchestrate.completed` | All done, includes full synthesis |
-| `schedule.created` | Recurring schedule detected and created |
+| Event | When |
+|-------|------|
+| `orchestrate.started` | Request accepted |
+| `orchestrate.message` | Orchestrator sends a status message |
+| `orchestrator.tool_use` | Orchestrator invoked a tool (delegate_agent, finish, curl, etc) |
+| `orchestrator.tool_result` | Tool returned |
+| `orchestrator.question` | `ask_user` invoked |
+| `agent.started` | Subagent began work |
+| `agent.tool_use` | Subagent used a tool |
+| `agent.output` | Subagent streaming text |
+| `agent.completed` | Subagent finished |
+| `agent.error` | Subagent errored |
+| `orchestrate.completed` | Full run done |
 
-### `POST /groups/:id/task`
+### Other endpoints
 
-Send a task to a specific agent in the group (bypasses orchestrator).
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/groups` | List all groups |
+| GET | `/groups/:id` | Get group details |
+| DELETE | `/groups/:id` | Destroy a group |
+| POST | `/groups/:id/task` | Task a specific agent (bypasses orchestrator) |
+| POST | `/groups/:id/exec` | Run a shell command in the container |
+| POST | `/groups/:id/members` | Add a member |
+| DELETE | `/groups/:id/members/:name` | Remove a member |
+
+## Memory — 3 Scopes
+
+Memory is backed by MemPalace (ChromaDB) with 3 tenant types:
+
+| Scope | Tenant | Purpose |
+|-------|--------|---------|
+| User | `user/{userId}` | Personal preferences across all groups |
+| Group | `group/{groupId}` | Shared project context within a group |
+| Agent | `agent/{agentName}` | Per-agent learnings and preferences |
+
+Memory is auto-injected into every system prompt before a task runs, and auto-saved after each task completes.
+
+Agents can also invoke `memory_search` and `memory_store` tools via the platform API.
+
+## Platform Tools
+
+The MCP orchestrator exposes tools from the Agentify backend via `/api/tools/:name` (HTTP, not MCP). Agents invoke them with curl:
 
 ```bash
-curl -N -X POST http://localhost:3100/groups/abc123/task \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-secret" \
-  -d '{"agent_name": "frontend", "prompt": "Add a dark mode toggle"}'
+API_URL=$(jq -r .api_url /workspace/shared/context.json)
+API_TOKEN=$(jq -r .api_token /workspace/shared/context.json)
+CONV_ID=$(jq -r .conversation_id /workspace/shared/context.json)
+
+curl -X POST "$API_URL/api/tools/schedule_create" \
+  -H "x-api-token: $API_TOKEN" \
+  -d '{"conversation_id":"'$CONV_ID'","cron":"*/10 * * * *","name":"News","prompt":"Fetch news"}'
 ```
 
-### `POST /groups/:id/members`
+Available platform tools:
 
-Add a new member to an existing group.
-
-### `DELETE /groups/:id/members/:name`
-
-Remove a member from a group.
-
-### `GET /groups` | `GET /groups/:id` | `DELETE /groups/:id`
-
-List, get details, or destroy a group.
+- `schedule_create` / `schedule_list` / `schedule_delete` — recurring tasks
+- `deploy_app` — publish app to production subdomain
+- `credential_get` — fetch user secrets (never hardcode)
+- `memory_search` / `memory_store` — persistent memory
+- `project_file_read` / `project_file_write` — user's cloud container
+- `github_create_repo` — GitHub operations
 
 ## Publishing & Deploy
 
-Every agent (individual or in a group) gets three ways to publish:
+Every group gets three ways to publish:
 
 | Method | How | URL |
 |--------|-----|-----|
-| **Static** | Save to `/publish/` | `http://HOST:PORT/sites/{id}/` |
-| **Dynamic** | Start server on dedicated port | `http://HOST:{port}/` |
-| **Production** | Register subdomain via Container Manager | `https://{name}.agentsfy.cc` |
+| Static | Save to `/publish/` | `http://HOST:8200/sites/{id}/` |
+| Dynamic | Server on dedicated port | `http://HOST:{port}/` |
+| Production | Register subdomain via Container Manager | `https://{name}.agentsfy.cc` |
 
-Agents are taught these capabilities via injected system prompts — they publish automatically when asked.
+The Agentify backend auto-registers subdomain + app after a successful orchestration when `/publish` has content.
 
 ## Container Specs
 
-| Resource | Individual Agent | Group |
-|----------|-----------------|-------|
-| Memory | 2 GB | 4 GB |
-| CPU Shares | 512 | 1024 |
-| Base Image | `node:20-slim` | `node:20-slim` |
-| Installed | Claude Code CLI, git, curl | Same |
-| Filesystem | `/workspace` (isolated) | `/workspace` (shared by all agents) |
-| Publish | `/publish` (volume mount) | `/publish` (volume mount) |
+| Resource | Group |
+|----------|-------|
+| Memory | 4 GB |
+| CPU Shares | 1024 |
+| Base | `node:20-slim` |
+| User | `agent` (uid 1001) — required for `bypassPermissions` mode |
+| Installed | Claude Code CLI, node, jq, git, curl, sudo |
+| MCP Server | `/opt/mcp/mcp-server.js` (loaded by `claude --mcp-config`) |
+| Shared | `/workspace` (all agents), `/publish` (auto-served) |
 
 ## Recovery
 
-On startup, the API scans Docker for containers with `claude-agents=true` or `claude-groups=true` labels and re-registers them.
+On startup, the API scans Docker for containers labeled `claude-groups=true` or `claude-agents=true` and re-registers them in memory. Running orchestrations are not preserved across restarts.
 
 ## License
 
