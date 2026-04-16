@@ -23,6 +23,90 @@ const CONTAINER_PREFIX = "claude-agent-";
 const GROUP_PREFIX = "claude-group-";
 const PORT_RANGE_START = 9000;
 const PORT_RANGE_END = 9999;
+const MCP_CALLBACK_PORT = Number(process.env.MCP_CALLBACK_PORT) || 8201;
+
+// ============================================================
+//  ACTIVE ORCHESTRATIONS — track running runs so MCP callbacks
+//  can dispatch subagents and stream events back to the user.
+// ============================================================
+const activeRuns = new Map(); // token → { group, sendEvent, onFinish }
+
+function registerActiveRun(token, ctx) { activeRuns.set(token, ctx); }
+function unregisterActiveRun(token) { activeRuns.delete(token); }
+
+// ============================================================
+//  MCP CALLBACK SERVER — receives tool calls from MCP server running
+//  inside the group container. Spawns subagent executions.
+// ============================================================
+const mcpApp = express();
+mcpApp.use(express.json({ limit: "10mb" }));
+
+function mcpAuth(req, res, next) {
+  const token = req.headers["x-mcp-token"];
+  if (!token || !activeRuns.has(token)) {
+    return res.status(401).json({ error: "invalid or expired mcp token" });
+  }
+  req.mcpCtx = activeRuns.get(token);
+  next();
+}
+
+// POST /delegate — orchestrator calls this to run a member agent
+mcpApp.post("/delegate", mcpAuth, async (req, res) => {
+  const { agent_name, task } = req.body;
+  const ctx = req.mcpCtx;
+  const group = ctx.group;
+  const member = group.members.find(m => m.name === agent_name);
+
+  if (!member) {
+    return res.json({ error: "agent_not_found", agent_name, available: group.members.map(m => m.name) });
+  }
+
+  ctx.sendEvent("agent.started", { agent_name, task });
+
+  try {
+    const container = docker.getContainer(group.container_id);
+    const agentMemory = await getMemoryContext(agent_name, group.id, ctx.userId, task);
+    const agentSysPrompt = member.system_prompt + agentMemory;
+
+    const taskCmd = buildClaudeCmd(task, agentSysPrompt, {
+      allowedTools: ["Bash", "Write", "Edit", "Read", "WebFetch", "WebSearch"],
+    });
+
+    const { text: output } = await parseClaudeStream(container, taskCmd, (evt) => {
+      if (evt.type === "text") ctx.sendEvent("agent.output", { agent_name, text: evt.text });
+      else if (evt.type === "tool_use") ctx.sendEvent("agent.tool_use", { agent_name, tool: evt.name, input: evt.input });
+      else if (evt.type === "tool_result") ctx.sendEvent("agent.tool_result", { agent_name, output: evt.output });
+    });
+
+    autoSaveMemory(agent_name, group.id, ctx.userId, task, (output || "").trim());
+    ctx.sendEvent("agent.completed", { agent_name, output: (output || "").trim() });
+
+    // Return to orchestrator (truncate if too long)
+    const truncated = (output || "").length > 8000 ? (output.slice(0, 8000) + "\n...[truncated]") : output;
+    res.json({ agent_name, output: truncated });
+  } catch (err) {
+    ctx.sendEvent("agent.error", { agent_name, error: err.message });
+    res.json({ agent_name, error: err.message });
+  }
+});
+
+// POST /ask-user — orchestrator pauses and sends question
+mcpApp.post("/ask-user", mcpAuth, async (req, res) => {
+  const { question } = req.body;
+  req.mcpCtx.sendEvent("orchestrator.question", { text: question });
+  res.json({ status: "sent", note: "User has been notified. Return this to orchestrator to signal end of turn." });
+});
+
+// POST /finish — explicit finish
+mcpApp.post("/finish", mcpAuth, async (req, res) => {
+  const { summary } = req.body;
+  req.mcpCtx.finishedSummary = summary || "";
+  res.json({ ok: true });
+});
+
+mcpApp.listen(MCP_CALLBACK_PORT, "0.0.0.0", () => {
+  console.log("MCP callback server listening on " + MCP_CALLBACK_PORT);
+});
 
 // ============================================================
 //  MEMORY SYSTEM — 3 scopes: agent, group, user
@@ -259,8 +343,11 @@ You are in a team chat. Keep messages SHORT (max 3 sentences unless explicitly a
 // --- Build claude -p command with base64 encoding ---
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "claude-opus-4-7";
 
+// --bare prefix: exports OAuth token as ANTHROPIC_API_KEY (bare mode needs API key, not OAuth file)
+const BARE_PREFIX = 'export ANTHROPIC_API_KEY="$(jq -r .claudeAiOauth.accessToken /home/agent/.claude/.credentials.json)" && ';
+
 function buildClaudeCmd(prompt, systemPrompt, options = {}) {
-  let cmd = "claude -p --permission-mode bypassPermissions --output-format stream-json --verbose";
+  let cmd = "claude -p --bare --permission-mode bypassPermissions --output-format stream-json --verbose";
   if (systemPrompt) {
     const sysB64 = Buffer.from(systemPrompt).toString("base64");
     cmd += ' --system-prompt "$(echo ' + sysB64 + ' | base64 -d)"';
@@ -271,7 +358,7 @@ function buildClaudeCmd(prompt, systemPrompt, options = {}) {
     for (const t of options.allowedTools) cmd += " --allowedTools " + t;
   }
   const promptB64 = Buffer.from(prompt).toString("base64");
-  return "echo " + promptB64 + " | base64 -d | " + cmd;
+  return BARE_PREFIX + "echo " + promptB64 + " | base64 -d | " + cmd;
 }
 
 // Parse stream-json output from claude -p and emit structured events
@@ -535,192 +622,118 @@ app.post("/groups/:id/orchestrate", auth, async (req, res) => {
     const container = docker.getContainer(group.container_id);
     const hostIp = getHostIp();
 
-    // Build orchestrator system prompt
+    // Build orchestrator system prompt — tools-first, no regex blocks
     const memberList = group.members.map(m => "- " + m.name + " (" + m.role + ")").join("\n");
-    const orchestratorPrompt = `You are the Orchestrator of group "${group.name}" in the Agentsfy platform.
+    const orchestratorPrompt = `You are the Orchestrator of group "${group.name}" on the Agentsfy platform.
 
-## YOUR TEAM (delegate work to these agents):
+## YOUR TEAM (delegate via tools):
 ${memberList}
 
-These are YOUR agents. They run in the same container as you and have all the tools they need (Bash, Write, Edit, Read, WebFetch, WebSearch). When the user asks for something, you DELEGATE to the appropriate team member — you do NOT do the work yourself.
+## AVAILABLE MCP TOOLS (from 'agentsfy-orchestrator' server)
 
-## WORKSPACE
-- All members share /workspace. Use /workspace/shared for cross-agent files.
-- Files in /publish are auto-served at http://HOST:${PORT}/sites/${group.id}/
-- Port ${group.port} is available for dynamic apps
-- Production URL: https://${group.subdomain}.${DOMAIN}
-- User credentials (API keys, tokens) are in /workspace/shared/credentials.json
+- **delegate_agent(agent_name, task)** — Run a team member. Returns the agent's output. For sequential work (A writes file, B reads it), call this tool MULTIPLE TIMES: wait for A's result, then call for B. DO NOT call delegate_agent twice in parallel when the second depends on the first.
+- **ask_user(question)** — Pause and ask the user something. Use when you need info you do not have.
+- **finish(summary)** — Signal you are done. Optional short summary.
+
+## ALSO AVAILABLE — PLATFORM TOOLS via curl
+
+Read /workspace/shared/context.json for api_url/api_token. Call:
+  curl -X POST "$API_URL/api/tools/schedule_create" -H "x-api-token: $API_TOKEN" -d '{"conversation_id":"...","cron":"...","name":"...","prompt":"..."}'
+
+Key tools: schedule_create, deploy_app, credential_get, memory_search, memory_store.
+
+## WORKFLOW
+
+1. Read the user request.
+2. If it needs delegation, call delegate_agent. **Wait for the result.**
+3. Based on the result, decide the next step: another delegate, ask_user, or finish.
+4. Keep the chat updated with BRIEF plain text between tool calls (1-2 sentences).
+5. Always call finish() when you're done.
 
 ## CRITICAL RULES
 
-1. **NEVER mention Anthropic MCP connectors, remote triggers, claude.ai settings, or "available in your account"** — those don't exist here. You are running inside the Agentsfy Docker container with your own team of agents.
+- NEVER do the task yourself — always delegate to the right member.
+- NEVER output DELEGATE:/SCHEDULE: blocks in text — those are OBSOLETE. Use the tools.
+- NEVER invent IDs or fake confirmations.
+- For recurring tasks, call the schedule_create platform tool via curl (and make the schedule's prompt a plain Portuguese sentence, NOT a DELEGATE block).
+- If delegate_agent fails, say so in one line and either retry with a fix or ask_user for help.
 
-2. **NEVER say an agent needs to be "connected"** — every agent listed above is already a member of this group and already inside this container. They can already do their job.
+## RESPONSE STYLE
 
-3. **Bitrix Agent, Web Researcher, and all other agents DO have access** to whatever they need. They read credentials from /workspace/shared/credentials.json and can make HTTP calls, run scripts, etc.
-
-4. **NEVER invent job IDs, expiration dates, or fake confirmations.** The system handles scheduling automatically.
-
-5. **NEVER refuse a schedule because of "minimum interval"** — there is NO minimum interval in the Agentsfy scheduler. Cron like */5 * * * * works fine.
-
-## RESPONSE STYLE — BE BRIEF
-
-You are having a conversation with the user. Talk like a team lead updating a chat, NOT writing a report.
-
-- **ONE sentence plans.** "Vou pedir pro Web Researcher buscar as notícias, depois o Bitrix envia pro Lucas."
-- **ONE line status updates.** "Web Researcher pronto — 8 notícias encontradas."
-- **NO giant markdown tables, NO long bullet lists, NO emoji headers, NO "## Follow-up necessário".**
-- **NO repeating agent output** — the user already saw what the agent said. Just confirm outcome.
-- If something failed, say what and suggest ONE fix, in one line.
-- Max 3 sentences per message.
-
-## OUTPUT BLOCKS
-
-Delegate (when needed):
-DELEGATE:
-[{"agent_name": "exact-member-name", "task": "what to do, with file paths and specifics"}]
-END_DELEGATE
-
-Schedule recurring tasks:
-SCHEDULE:
-{"cron": "*/5 * * * *", "name": "Name", "prompt": "Plain-language task description in Portuguese"}
-END_SCHEDULE
-
-CRITICAL — SCHEDULE.prompt rules:
-- Must be plain human-language describing what to do each run.
-- Example GOOD: "Busque notícias novas do Brasil e envie as manchetes pro Lucas Augusto no Bitrix."
-- Example BAD (DO NOT DO THIS): prompt containing "DELEGATE:", "END_DELEGATE", or JSON arrays.
-- The scheduler will feed this prompt back to YOU (orchestrator) on each run, and you will delegate from scratch. So the prompt should READ like a user request, not like a DELEGATE block.
-
-Cron examples: */5 * * * * (5 min), 0 * * * * (hourly), 0 9 * * * (daily 9am).
-
-For schedules: just output the block + ONE sentence "Agendei X a cada Y". Nothing else.
-
-## SEQUENTIAL TASKS
-
-When one agent depends on another's output (e.g. Web Researcher writes a file, then Bitrix reads it), delegate SEQUENTIALLY — wait for the first to finish before running the second. You control this by calling delegate multiple times in separate turns, OR by putting them in SEQUENCE in a single DELEGATE:
-
-DELEGATE_SEQUENTIAL:
-[{"agent_name": "A", "task": "..."}, {"agent_name": "B", "task": "..."}]
-END_DELEGATE_SEQUENTIAL
-
-Regular DELEGATE runs in parallel — only use when tasks are independent.
+Brief. 1-3 sentences between tool calls. No markdown tables, no bullet lists, no "Follow-up" sections.
 
 ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}
 ${memoryContext}`;
 
     sendEvent("orchestrate.started", { group_id: group.id, prompt });
 
-    // Step 1: Ask orchestrator to plan (stream-json)
-    const planCmd = buildClaudeCmd(prompt, orchestratorPrompt, {});
-    const { text: plan } = await parseClaudeStream(container, planCmd, (evt) => {
-      if (evt.type === "text") {
-        sendEvent("orchestrate.planning", { text: evt.text });
-      } else if (evt.type === "tool_use") {
-        sendEvent("agent.tool_use", { sender: "Orchestrator", tool: evt.name, input: evt.input });
-      } else if (evt.type === "tool_result") {
-        sendEvent("agent.tool_result", { sender: "Orchestrator", output: evt.output });
-      }
+    // Register this run so MCP callbacks can dispatch subagents and stream events
+    const mcpToken = uuidv4();
+    registerActiveRun(mcpToken, {
+      group,
+      userId: user_id,
+      sendEvent,
+      finishedSummary: null,
     });
 
-    sendEvent("orchestrate.plan_ready", { plan: (plan || "").trim() });
-
-    // Step 2: Parse delegations — sequential first, then parallel
-    const seqMatch = plan.match(/DELEGATE_SEQUENTIAL:\s*\n?\s*(\[[\s\S]*?\])\s*\n?\s*END_DELEGATE_SEQUENTIAL/);
-    const delegateMatch = plan.match(/DELEGATE:\s*\n?\s*(\[[\s\S]*?\])\s*\n?\s*END_DELEGATE/);
-    let delegations = [];
-    let sequential = false;
-    if (seqMatch) {
-      try { delegations = JSON.parse(seqMatch[1]); sequential = true; } catch (_) {}
-    } else if (delegateMatch) {
-      try { delegations = JSON.parse(delegateMatch[1]); } catch (_) {}
-    }
-
-    // Step 3: Execute delegated tasks (parallel or sequential)
-    const results = [];
-    if (delegations.length > 0) {
-      sendEvent("orchestrate.delegating", { mode: sequential ? "sequential" : "parallel", tasks: delegations.map(d => ({ agent_name: d.agent_name, task: d.task.slice(0, 100) })) });
-
-      const runOne = async (d) => {
-        const member = group.members.find(m => m.name === d.agent_name);
-        if (!member) return { agent_name: d.agent_name, output: "Agent not found in group", error: true };
-
-        sendEvent("agent.started", { agent_name: d.agent_name, task: d.task });
-
-        try {
-          // Inject agent-specific memory
-          const agentMemory = await getMemoryContext(d.agent_name, group.id, user_id, d.task);
-          const agentSysPrompt = member.system_prompt + agentMemory;
-
-          const taskCmd = buildClaudeCmd(d.task, agentSysPrompt, {
-
-
-            allowedTools: ["Bash", "Write", "Edit", "Read"],
-          });
-
-          const { text: output } = await parseClaudeStream(container, taskCmd, (evt) => {
-            if (evt.type === "text") {
-              sendEvent("agent.output", { agent_name: d.agent_name, text: evt.text });
-            } else if (evt.type === "tool_use") {
-              sendEvent("agent.tool_use", { agent_name: d.agent_name, tool: evt.name, input: evt.input });
-            } else if (evt.type === "tool_result") {
-              sendEvent("agent.tool_result", { agent_name: d.agent_name, output: evt.output });
-            }
-          });
-
-          // Auto-save agent + group memories
-          autoSaveMemory(d.agent_name, group.id, user_id, d.task, output.trim());
-
-          sendEvent("agent.completed", { agent_name: d.agent_name, output: output.trim() });
-          return { agent_name: d.agent_name, output: output.trim() };
-        } catch (err) {
-          sendEvent("agent.error", { agent_name: d.agent_name, error: err.message });
-          return { agent_name: d.agent_name, output: "Error: " + err.message, error: true };
-        }
+    try {
+      // Build mcp-config JSON string for --mcp-config
+      const mcpHost = process.env.MCP_HOST_FROM_CONTAINER || "host.docker.internal";
+      const mcpConfig = {
+        mcpServers: {
+          "agentsfy-orchestrator": {
+            type: "stdio",
+            command: "node",
+            args: ["/opt/mcp/mcp-server.js"],
+            env: {
+              MCP_CALLBACK_URL: "http://" + mcpHost + ":" + MCP_CALLBACK_PORT,
+              MCP_TOKEN: mcpToken,
+              GROUP_ID: group.id,
+              CONV_ID: req.body.conversation_id || "",
+            },
+          },
+        },
       };
+      const mcpConfigB64 = Buffer.from(JSON.stringify(mcpConfig)).toString("base64");
 
-      if (sequential) {
-        for (const d of delegations) {
-          const r = await runOne(d);
-          results.push(r);
+      // Build the orchestrator claude command with --mcp-config
+      const promptB64 = Buffer.from(prompt).toString("base64");
+      const sysB64 = Buffer.from(orchestratorPrompt).toString("base64");
+      const cmd = [
+        BARE_PREFIX + "echo " + promptB64 + " | base64 -d |",
+        "claude -p",
+        "--bare",
+        "--permission-mode bypassPermissions",
+        "--output-format stream-json",
+        "--verbose",
+        "--model " + DEFAULT_MODEL,
+        '--system-prompt "$(echo ' + sysB64 + ' | base64 -d)"',
+        '--mcp-config "$(echo ' + mcpConfigB64 + ' | base64 -d)"',
+      ].join(" ");
+
+      const { text: finalText } = await parseClaudeStream(container, cmd, (evt) => {
+        if (evt.type === "text") {
+          sendEvent("orchestrate.message", { text: evt.text });
+        } else if (evt.type === "tool_use") {
+          // Track orchestrator-level tool use (MCP or builtin)
+          sendEvent("orchestrator.tool_use", { tool: evt.name, input: evt.input });
+        } else if (evt.type === "tool_result") {
+          sendEvent("orchestrator.tool_result", { output: evt.output });
         }
-      } else {
-        const settled = await Promise.all(delegations.map(runOne));
-        results.push(...settled);
-      }
-    }
-
-    // Step 4: Synthesize results
-    if (results.length > 0) {
-      const synthesisPrompt = "Team finished. Results:\n\n" +
-        results.map(r => "[" + r.agent_name + "] " + r.output.slice(0, 1500)).join("\n\n") +
-        "\n\nIn 1-2 sentences, tell the user what got done. Include any live URLs. DO NOT make lists, tables, or re-paste agent output.";
-
-      const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Reply in 1-2 sentences max. No markdown tables, no bullet lists, no headings. Just what happened.", {});
-
-      const { text: synthesis } = await parseClaudeStream(container, synthesisCmd, (evt) => {
-        if (evt.type === "text") sendEvent("orchestrate.synthesis", { text: evt.text });
       });
 
-      sendEvent("orchestrate.completed", { synthesis: (synthesis || "").trim(), results });
-    } else {
-      // No delegation — orchestrator answered directly
-      sendEvent("orchestrate.completed", { synthesis: (plan || "").trim(), results: [] });
+      const ctx = activeRuns.get(mcpToken);
+      const summary = ctx?.finishedSummary || finalText || "";
+
+      sendEvent("orchestrate.completed", { synthesis: (summary || "").trim(), results: [] });
+
+      // Auto-save summary to group memory
+      if (summary) autoSaveMemory("orchestrator", group.id, user_id, prompt, summary.trim());
+
+      group.tasks_completed++;
+    } finally {
+      unregisterActiveRun(mcpToken);
     }
-
-    // Step 5: Check for schedules
-    const scheduleMatch = plan.match(/SCHEDULE:\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*END_SCHEDULE/);
-    if (scheduleMatch) {
-      try {
-        const schedule = JSON.parse(scheduleMatch[1]);
-        sendEvent("schedule.created", schedule);
-      } catch (_) {}
-    }
-
-    group.tasks_completed++;
-
-    // Auto-save orchestration summary to group memory
-    autoSaveMemory("orchestrator", group.id, user_id, prompt, plan.trim());
   } catch (err) {
     sendEvent("orchestrate.error", { error: err.message });
   } finally {
