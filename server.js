@@ -19,12 +19,19 @@ const CLOUD_API_SECRET = process.env.CLOUD_API_SECRET || "agentify-cloud-secret-
 const DOMAIN = process.env.DOMAIN || "agentsfy.cc";
 const IMAGE_NAME = "claude-agent:latest";
 const CONTAINER_PREFIX = "claude-agent-";
+const GROUP_PREFIX = "claude-group-";
 const PORT_RANGE_START = 9000;
 const PORT_RANGE_END = 9999;
 
-// In-memory agent registry
+// In-memory registries
 const agents = new Map();
+const groups = new Map();
 const allocatedPorts = new Set();
+
+function getHostIp() {
+  if (HOST_IP !== "0.0.0.0") return HOST_IP;
+  try { return require("os").networkInterfaces().eth0?.[0]?.address || "localhost"; } catch { return "localhost"; }
+}
 
 // --- Port allocation ---
 function allocatePort() {
@@ -37,61 +44,45 @@ function allocatePort() {
   throw new Error("No available ports in range " + PORT_RANGE_START + "-" + PORT_RANGE_END);
 }
 
-function releasePort(port) {
-  allocatedPorts.delete(port);
+function allocatePorts(n) {
+  const ports = [];
+  for (let i = 0; i < n; i++) ports.push(allocatePort());
+  return ports;
 }
 
-// --- Ensure deploys directory exists ---
+function releasePort(port) { allocatedPorts.delete(port); }
+
+// --- Ensure dirs ---
 try { fs.mkdirSync(DEPLOYS_DIR, { recursive: true }); } catch (_) {}
 
-// --- Static file serving for /publish volumes ---
+// --- Static file serving ---
 app.use("/sites", express.static(DEPLOYS_DIR));
 
 // --- Auth middleware ---
 function auth(req, res, next) {
-  const key = req.headers["x-api-key"];
-  if (key !== API_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  if (req.headers["x-api-key"] !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
   next();
 }
 
-// --- Helper: exec command in container ---
-async function containerExec(container, command, env = []) {
-  const exec = await container.exec({
-    Cmd: ["bash", "-c", command],
-    AttachStdout: true,
-    AttachStderr: true,
-    Env: env,
-  });
+// --- Docker exec helpers ---
+async function containerExec(container, command) {
+  const exec = await container.exec({ Cmd: ["bash", "-c", command], AttachStdout: true, AttachStderr: true });
   const stream = await exec.start({ hijack: true, stdin: false });
   return new Promise((resolve, reject) => {
     const chunks = [];
-    stream.on("data", (chunk) => {
-      const payload = chunk.length > 8 ? chunk.slice(8) : chunk;
-      chunks.push(payload);
-    });
-    stream.on("end", () => {
-      const output = Buffer.concat(chunks).toString("utf8");
-      resolve(output);
-    });
+    stream.on("data", (chunk) => { chunks.push(chunk.length > 8 ? chunk.slice(8) : chunk); });
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     stream.on("error", reject);
   });
 }
 
-// --- Helper: exec with streaming ---
 async function containerExecStream(container, command, onData) {
-  const exec = await container.exec({
-    Cmd: ["bash", "-c", command],
-    AttachStdout: true,
-    AttachStderr: true,
-  });
+  const exec = await container.exec({ Cmd: ["bash", "-c", command], AttachStdout: true, AttachStderr: true });
   const stream = await exec.start({ hijack: true, stdin: false });
   return new Promise((resolve, reject) => {
     const chunks = [];
     stream.on("data", (chunk) => {
-      const payload = chunk.length > 8 ? chunk.slice(8) : chunk;
-      const text = payload.toString("utf8");
+      const text = (chunk.length > 8 ? chunk.slice(8) : chunk).toString("utf8");
       chunks.push(text);
       if (onData) onData(text);
     });
@@ -100,150 +91,452 @@ async function containerExecStream(container, command, onData) {
   });
 }
 
-// --- Helper: register subdomain via Container Manager API ---
-async function registerSubdomain(subdomain, containerName, port, ip) {
-  try {
-    const http = require("http");
-    const data = JSON.stringify({ subdomain, container_name: containerName, port, ip: ip || undefined });
-    return new Promise((resolve, reject) => {
-      const url = new URL(CLOUD_API_URL + "/subdomains");
-      const req = http.request({
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": CLOUD_API_SECRET },
-      }, (res) => {
-        let body = "";
-        res.on("data", (c) => body += c);
-        res.on("end", () => resolve(JSON.parse(body)));
-      });
-      req.on("error", reject);
-      req.write(data);
-      req.end();
-    });
-  } catch (err) {
-    console.error("Subdomain registration failed:", err.message);
-    return null;
-  }
+// --- Inject credentials into a container ---
+async function injectCredentials(container) {
+  const credentials = fs.readFileSync(CREDENTIALS_PATH, "utf8");
+  await containerExec(container, "mkdir -p /root/.claude");
+  const credB64 = Buffer.from(credentials).toString("base64");
+  await containerExec(container, "echo " + credB64 + " | base64 -d > /root/.claude/.credentials.json");
 }
 
-// --- Build the system prompt injection for publish/port awareness ---
-function buildPublishInstructions(id, agentPort, hostIp, subdomain) {
+// --- Build publish instructions ---
+function buildPublishInstructions(groupId, agentPort, subdomain) {
+  const hostIp = getHostIp();
   return `
-
 IMPORTANT - Publishing & Deploy capabilities:
 You have THREE ways to make your work accessible externally:
 
-1. STATIC FILES (websites, landing pages, HTML files):
-   Save files to /publish/ directory. They are automatically served at:
-   http://${hostIp}:${PORT}/sites/${id}/
-   Example: save /publish/index.html -> accessible at http://${hostIp}:${PORT}/sites/${id}/index.html
+1. STATIC FILES: Save to /publish/ -> auto-served at http://${hostIp}:${PORT}/sites/${groupId}/
 
-2. DYNAMIC APPS (Node servers, APIs, Python apps):
-   Your dedicated port is ${agentPort}. Start your server on port ${agentPort} inside the container.
-   It will be accessible externally at: http://${hostIp}:${agentPort}/
-   Example: express app listening on port ${agentPort} -> accessible at http://${hostIp}:${agentPort}/
+2. DYNAMIC APPS: Start server on port ${agentPort} -> http://${hostIp}:${agentPort}/
 
-3. PRODUCTION DEPLOY with subdomain (PREFERRED for final delivery):
-   Your subdomain is: https://${subdomain}.${DOMAIN}
-   To deploy a static site: save files to /publish/, then run this command to register:
-     curl -s -X POST http://127.0.0.1:9090/subdomains -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" -d '{"subdomain":"${subdomain}","container_name":"${CONTAINER_PREFIX}${id}","port":${agentPort},"ip":"127.0.0.1"}'
-   To deploy a dynamic app: start your server on port ${agentPort}, then run the same curl command above.
-   After registering, the app will be live at: https://${subdomain}.${DOMAIN}
+3. PRODUCTION DEPLOY (PREFERRED):
+   Subdomain: https://${subdomain}.${DOMAIN}
+   For static: npm install -g serve && serve /publish -l ${agentPort} -s &
+   Then register: curl -s -X POST http://127.0.0.1:9090/subdomains -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" -d '{"subdomain":"${subdomain}","container_name":"${GROUP_PREFIX}${groupId}","port":${agentPort},"ip":"127.0.0.1"}'
+   Live at: https://${subdomain}.${DOMAIN}
 
-   For static sites, install and start serve first:
-     npm install -g serve && serve /publish -l ${agentPort} -s &
-   Then register the subdomain with the curl command above.
-
-When you deploy something, ALWAYS tell the user the https://${subdomain}.${DOMAIN} URL.
-Prefer option 3 (production deploy) when the user asks to deploy or publish something for real.
+When deploying, ALWAYS tell the user the production URL. All agents in this group share the /workspace filesystem.
 `;
 }
 
-// --- POST /agents - Create a new agent ---
+// --- Build claude -p command with base64 encoding ---
+function buildClaudeCmd(prompt, systemPrompt, options = {}) {
+  let cmd = "claude -p";
+  if (systemPrompt) {
+    const sysB64 = Buffer.from(systemPrompt).toString("base64");
+    cmd += ' --system-prompt "$(echo ' + sysB64 + ' | base64 -d)"';
+  }
+  if (options.model) cmd += " --model " + options.model;
+  if (options.max_turns) cmd += " --max-turns " + options.max_turns;
+  if (options.allowedTools) {
+    for (const t of options.allowedTools) cmd += " --allowedTools " + t;
+  }
+  const promptB64 = Buffer.from(prompt).toString("base64");
+  return "echo " + promptB64 + " | base64 -d | " + cmd;
+}
+
+// ============================================================
+//  GROUPS API — 1 container, N agents as Claude Code sessions
+// ============================================================
+
+// --- POST /groups — Create a group with shared container ---
+app.post("/groups", auth, async (req, res) => {
+  try {
+    const { name, members, description } = req.body;
+    if (!name || !members || !Array.isArray(members) || members.length === 0) {
+      return res.status(400).json({ error: "name and members[] are required" });
+    }
+
+    const id = uuidv4().slice(0, 8);
+    const containerName = GROUP_PREFIX + id;
+    const subdomain = name.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
+    const mainPort = allocatePort();
+
+    // Create deploy dir
+    const deployDir = DEPLOYS_DIR + "/" + id;
+    fs.mkdirSync(deployDir, { recursive: true });
+
+    // Build port bindings — main port for the group
+    const exposedPorts = { [mainPort + "/tcp"]: {} };
+    const portBindings = { [mainPort + "/tcp"]: [{ HostPort: String(mainPort) }] };
+
+    // Create single container for the whole group
+    const container = await docker.createContainer({
+      Image: IMAGE_NAME,
+      name: containerName,
+      Hostname: containerName,
+      Env: [
+        "GROUP_ID=" + id,
+        "GROUP_NAME=" + name,
+        "AGENT_PORT=" + mainPort,
+      ],
+      ExposedPorts: exposedPorts,
+      HostConfig: {
+        Memory: 4 * 1024 * 1024 * 1024, // 4GB for group
+        CpuShares: 1024,
+        RestartPolicy: { Name: "unless-stopped" },
+        Binds: [deployDir + ":/publish"],
+        PortBindings: portBindings,
+      },
+      Labels: {
+        "claude-groups": "true",
+        "group-id": id,
+        "group-name": name,
+        "group-port": String(mainPort),
+      },
+    });
+
+    await container.start();
+    await injectCredentials(container);
+
+    // Create workspace dirs for each agent
+    const memberDirs = members.map(m => "/workspace/" + m.name.replace(/[^a-z0-9_-]/gi, "_")).join(" ");
+    await containerExec(container, "mkdir -p " + memberDirs + " /workspace/shared");
+
+    // Verify Claude Code works
+    const verify = await containerExec(container, 'echo "respond with exactly: GROUP_READY" | claude -p 2>&1');
+    const isReady = verify.includes("GROUP_READY");
+
+    const hostIp = getHostIp();
+    const publishInstructions = buildPublishInstructions(id, mainPort, subdomain);
+
+    // Build member registry
+    const memberRegistry = members.map(m => ({
+      id: m.id || uuidv4().slice(0, 8),
+      name: m.name,
+      role: m.role || m.name,
+      system_prompt: (m.system_prompt || "You are " + m.name + ", a skilled professional.") + publishInstructions +
+        "\nYou share /workspace with other agents. Your personal dir is /workspace/" + m.name.replace(/[^a-z0-9_-]/gi, "_") +
+        " but you can read/write anywhere in /workspace. Use /workspace/shared for files other agents need.",
+    }));
+
+    const group = {
+      id,
+      name,
+      description: description || "",
+      container_name: containerName,
+      container_id: container.id,
+      status: isReady ? "ready" : "starting",
+      members: memberRegistry,
+      port: mainPort,
+      subdomain,
+      publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
+      dynamic_url: "http://" + hostIp + ":" + mainPort + "/",
+      production_url: "https://" + subdomain + "." + DOMAIN,
+      created_at: new Date().toISOString(),
+      tasks_completed: 0,
+    };
+
+    groups.set(id, group);
+    res.status(201).json(group);
+  } catch (err) {
+    console.error("Error creating group:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- GET /groups ---
+app.get("/groups", auth, async (req, res) => {
+  res.json(Array.from(groups.values()));
+});
+
+// --- GET /groups/:id ---
+app.get("/groups/:id", auth, async (req, res) => {
+  const group = groups.get(req.params.id);
+  if (!group) return res.status(404).json({ error: "Group not found" });
+  res.json(group);
+});
+
+// --- DELETE /groups/:id ---
+app.delete("/groups/:id", auth, async (req, res) => {
+  try {
+    const group = groups.get(req.params.id);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+    const container = docker.getContainer(group.container_id);
+    try { await container.stop(); } catch (_) {}
+    await container.remove({ force: true });
+    if (group.port) releasePort(group.port);
+    groups.delete(req.params.id);
+    res.json({ deleted: true, id: req.params.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- POST /groups/:id/task — Send task to a specific agent in the group ---
+app.post("/groups/:id/task", auth, async (req, res) => {
+  const group = groups.get(req.params.id);
+  if (!group) return res.status(404).json({ error: "Group not found" });
+
+  const { agent_name, prompt, system_prompt, model, max_turns, allowedTools } = req.body;
+  if (!prompt) return res.status(400).json({ error: "prompt is required" });
+
+  // Find agent in group
+  const member = agent_name ? group.members.find(m => m.name === agent_name || m.id === agent_name) : null;
+  const sysPrompt = system_prompt || (member ? member.system_prompt : null);
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const sendEvent = (event, data) => {
+    res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n");
+  };
+
+  try {
+    const container = docker.getContainer(group.container_id);
+    const taskId = uuidv4().slice(0, 8);
+
+    sendEvent("task.started", { task_id: taskId, group_id: group.id, agent_name: agent_name || "default", prompt });
+
+    const cmd = buildClaudeCmd(prompt, sysPrompt, { model, max_turns, allowedTools });
+
+    const fullOutput = await containerExecStream(container, cmd, (chunk) => {
+      sendEvent("task.output", { task_id: taskId, agent_name: agent_name || "default", text: chunk });
+    });
+
+    group.tasks_completed++;
+    sendEvent("task.completed", { task_id: taskId, agent_name: agent_name || "default", output: fullOutput.trim() });
+  } catch (err) {
+    sendEvent("task.error", { error: err.message });
+  } finally {
+    res.end();
+  }
+});
+
+// --- POST /groups/:id/orchestrate — Full orchestration flow (SSE) ---
+app.post("/groups/:id/orchestrate", auth, async (req, res) => {
+  const group = groups.get(req.params.id);
+  if (!group) return res.status(404).json({ error: "Group not found" });
+
+  const { prompt, context } = req.body;
+  if (!prompt) return res.status(400).json({ error: "prompt is required" });
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+
+  const sendEvent = (event, data) => {
+    try { res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n"); } catch (_) {}
+  };
+
+  try {
+    const container = docker.getContainer(group.container_id);
+    const hostIp = getHostIp();
+
+    // Build orchestrator system prompt
+    const memberList = group.members.map(m => "- " + m.name + " (" + m.role + ")").join("\n");
+    const orchestratorPrompt = `You are the Orchestrator of group "${group.name}".
+Your job is to analyze the user's request, break it into tasks, and delegate to the right team members.
+
+TEAM MEMBERS:
+${memberList}
+
+WORKSPACE: All members share /workspace. Use /workspace/shared for cross-agent files.
+PUBLISH: Files in /publish are auto-served. Port ${group.port} is available for dynamic apps.
+PRODUCTION URL: https://${group.subdomain}.${DOMAIN}
+
+RESPOND WITH THIS EXACT FORMAT:
+
+First, briefly explain your plan (1-2 sentences).
+
+Then delegate tasks:
+DELEGATE:
+[{"agent_name": "exact-member-name", "task": "detailed task description with specific instructions"}]
+END_DELEGATE
+
+If the user asks for something recurring or you detect a pattern:
+SCHEDULE:
+{"cron": "0 9 * * *", "prompt": "what to do each time"}
+END_SCHEDULE
+
+Keep delegations specific and actionable. Include file paths, tech stack preferences, and coordination instructions.
+${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}`;
+
+    sendEvent("orchestrate.started", { group_id: group.id, prompt });
+
+    // Step 1: Ask orchestrator to plan
+    const planCmd = buildClaudeCmd(prompt, orchestratorPrompt, { max_turns: "1" });
+    const plan = await containerExecStream(container, planCmd, (chunk) => {
+      sendEvent("orchestrate.planning", { text: chunk });
+    });
+
+    sendEvent("orchestrate.plan_ready", { plan: plan.trim() });
+
+    // Step 2: Parse delegations
+    const delegateMatch = plan.match(/DELEGATE:\s*\n?\s*(\[[\s\S]*?\])\s*\n?\s*END_DELEGATE/);
+    let delegations = [];
+    if (delegateMatch) {
+      try { delegations = JSON.parse(delegateMatch[1]); } catch (_) {}
+    }
+
+    // Step 3: Execute delegated tasks in parallel
+    const results = [];
+    if (delegations.length > 0) {
+      sendEvent("orchestrate.delegating", { tasks: delegations.map(d => ({ agent_name: d.agent_name, task: d.task.slice(0, 100) })) });
+
+      const taskPromises = delegations.map(async (d) => {
+        const member = group.members.find(m => m.name === d.agent_name);
+        if (!member) return { agent_name: d.agent_name, output: "Agent not found in group", error: true };
+
+        sendEvent("agent.started", { agent_name: d.agent_name, task: d.task });
+
+        try {
+          const taskCmd = buildClaudeCmd(d.task, member.system_prompt, {
+            max_turns: "10",
+            allowedTools: ["Bash", "Write", "Edit", "Read"],
+          });
+
+          const output = await containerExecStream(container, taskCmd, (chunk) => {
+            sendEvent("agent.output", { agent_name: d.agent_name, text: chunk });
+          });
+
+          sendEvent("agent.completed", { agent_name: d.agent_name, output: output.trim() });
+          return { agent_name: d.agent_name, output: output.trim() };
+        } catch (err) {
+          sendEvent("agent.error", { agent_name: d.agent_name, error: err.message });
+          return { agent_name: d.agent_name, output: "Error: " + err.message, error: true };
+        }
+      });
+
+      const settled = await Promise.all(taskPromises);
+      results.push(...settled);
+    }
+
+    // Step 4: Synthesize results
+    if (results.length > 0) {
+      const synthesisPrompt = "The team has completed their tasks. Here are the results:\n\n" +
+        results.map(r => "## " + r.agent_name + "\n" + r.output).join("\n\n") +
+        "\n\nSummarize what was accomplished, list any URLs or deliverables, and note if anything needs follow-up.";
+
+      const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Synthesize team results concisely. Include all URLs and deliverables.", { max_turns: "1" });
+
+      const synthesis = await containerExecStream(container, synthesisCmd, (chunk) => {
+        sendEvent("orchestrate.synthesis", { text: chunk });
+      });
+
+      sendEvent("orchestrate.completed", { synthesis: synthesis.trim(), results });
+    } else {
+      // No delegation — orchestrator answered directly
+      sendEvent("orchestrate.completed", { synthesis: plan.trim(), results: [] });
+    }
+
+    // Step 5: Check for schedules
+    const scheduleMatch = plan.match(/SCHEDULE:\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*END_SCHEDULE/);
+    if (scheduleMatch) {
+      try {
+        const schedule = JSON.parse(scheduleMatch[1]);
+        sendEvent("schedule.created", schedule);
+      } catch (_) {}
+    }
+
+    group.tasks_completed++;
+  } catch (err) {
+    sendEvent("orchestrate.error", { error: err.message });
+  } finally {
+    res.end();
+  }
+});
+
+// --- POST /groups/:id/exec — Run command in group container ---
+app.post("/groups/:id/exec", auth, async (req, res) => {
+  try {
+    const group = groups.get(req.params.id);
+    if (!group) return res.status(404).json({ error: "Group not found" });
+    const container = docker.getContainer(group.container_id);
+    const output = await containerExec(container, req.body.command);
+    res.json({ output: output.trim(), group_id: group.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- POST /groups/:id/members — Add member to existing group ---
+app.post("/groups/:id/members", auth, async (req, res) => {
+  const group = groups.get(req.params.id);
+  if (!group) return res.status(404).json({ error: "Group not found" });
+  const { name, role, system_prompt } = req.body;
+  if (!name) return res.status(400).json({ error: "name is required" });
+
+  const publishInstructions = buildPublishInstructions(group.id, group.port, group.subdomain);
+  const member = {
+    id: uuidv4().slice(0, 8),
+    name,
+    role: role || name,
+    system_prompt: (system_prompt || "You are " + name + ", a skilled professional.") + publishInstructions +
+      "\nYou share /workspace with other agents. Your personal dir is /workspace/" + name.replace(/[^a-z0-9_-]/gi, "_"),
+  };
+
+  group.members.push(member);
+
+  // Create workspace dir
+  const container = docker.getContainer(group.container_id);
+  await containerExec(container, "mkdir -p /workspace/" + name.replace(/[^a-z0-9_-]/gi, "_"));
+
+  res.json({ added: true, member });
+});
+
+// --- DELETE /groups/:id/members/:name ---
+app.delete("/groups/:id/members/:name", auth, async (req, res) => {
+  const group = groups.get(req.params.id);
+  if (!group) return res.status(404).json({ error: "Group not found" });
+  group.members = group.members.filter(m => m.name !== req.params.name && m.id !== req.params.name);
+  res.json({ removed: true });
+});
+
+
+// ============================================================
+//  LEGACY AGENTS API — Individual containers (backwards compat)
+// ============================================================
+
 app.post("/agents", auth, async (req, res) => {
   try {
     const { name, system_prompt } = req.body;
     const id = uuidv4().slice(0, 8);
     const containerName = CONTAINER_PREFIX + id;
     const agentPort = allocatePort();
-
-    // Create host publish directory for this agent
     const agentDeployDir = DEPLOYS_DIR + "/" + id;
     fs.mkdirSync(agentDeployDir, { recursive: true });
 
-    const credentials = fs.readFileSync(CREDENTIALS_PATH, "utf8");
-
-    // Determine host IP for URLs
-    const hostIp = HOST_IP === "0.0.0.0" ? require("os").networkInterfaces().eth0?.[0]?.address || "localhost" : HOST_IP;
+    const hostIp = getHostIp();
+    const subdomain = (name || "agent-" + id).toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
 
     const container = await docker.createContainer({
-      Image: IMAGE_NAME,
-      name: containerName,
-      Hostname: containerName,
-      Env: [
-        "AGENT_ID=" + id,
-        "AGENT_NAME=" + (name || "agent-" + id),
-        "AGENT_PORT=" + agentPort,
-        "PUBLISH_DIR=/publish",
-      ],
-      ExposedPorts: {
-        [agentPort + "/tcp"]: {},
-      },
+      Image: IMAGE_NAME, name: containerName, Hostname: containerName,
+      Env: ["AGENT_ID=" + id, "AGENT_NAME=" + (name || "agent-" + id), "AGENT_PORT=" + agentPort],
+      ExposedPorts: { [agentPort + "/tcp"]: {} },
       HostConfig: {
-        Memory: 2 * 1024 * 1024 * 1024,
-        CpuShares: 512,
+        Memory: 2 * 1024 * 1024 * 1024, CpuShares: 512,
         RestartPolicy: { Name: "unless-stopped" },
-        Binds: [
-          agentDeployDir + ":/publish",
-        ],
-        PortBindings: {
-          [agentPort + "/tcp"]: [{ HostPort: String(agentPort) }],
-        },
+        Binds: [agentDeployDir + ":/publish"],
+        PortBindings: { [agentPort + "/tcp"]: [{ HostPort: String(agentPort) }] },
       },
-      Labels: {
-        "claude-agents": "true",
-        "agent-id": id,
-        "agent-name": name || "agent-" + id,
-        "agent-port": String(agentPort),
-      },
+      Labels: { "claude-agents": "true", "agent-id": id, "agent-name": name || "agent-" + id, "agent-port": String(agentPort) },
     });
 
     await container.start();
+    await injectCredentials(container);
 
-    // Inject credentials
-    await containerExec(container, "mkdir -p /root/.claude");
-    const credB64 = Buffer.from(credentials).toString("base64");
-    await containerExec(container, "echo " + credB64 + " | base64 -d > /root/.claude/.credentials.json");
-
-    // Verify Claude Code works
     const verify = await containerExec(container, 'echo "respond with exactly: AGENT_READY" | claude -p 2>&1');
-    const isReady = verify.includes("AGENT_READY");
-
-    // Generate subdomain from agent name
-    const subdomain = (name || "agent-" + id).toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
-
-    // Build combined system prompt with publish instructions
-    const publishInstructions = buildPublishInstructions(id, agentPort, hostIp, subdomain);
-    const fullSystemPrompt = (system_prompt || "") + publishInstructions;
+    const publishInstructions = buildPublishInstructions(id, agentPort, subdomain);
 
     const agent = {
-      id,
-      name: name || "agent-" + id,
-      container_name: containerName,
-      container_id: container.id,
-      status: isReady ? "ready" : "auth_pending",
-      system_prompt: fullSystemPrompt,
-      port: agentPort,
-      subdomain,
+      id, name: name || "agent-" + id, container_name: containerName, container_id: container.id,
+      status: verify.includes("AGENT_READY") ? "ready" : "auth_pending",
+      system_prompt: (system_prompt || "") + publishInstructions,
+      port: agentPort, subdomain,
       publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
       dynamic_url: "http://" + hostIp + ":" + agentPort + "/",
       production_url: "https://" + subdomain + "." + DOMAIN,
-      created_at: new Date().toISOString(),
-      tasks_completed: 0,
+      created_at: new Date().toISOString(), tasks_completed: 0,
     };
-
     agents.set(id, agent);
     res.status(201).json(agent);
   } catch (err) {
@@ -252,257 +545,137 @@ app.post("/agents", auth, async (req, res) => {
   }
 });
 
-// --- GET /agents - List all agents ---
-app.get("/agents", auth, async (req, res) => {
-  try {
-    const containers = await docker.listContainers({
-      all: true,
-      filters: { label: ["claude-agents=true"] },
-    });
+app.get("/agents", auth, (req, res) => { res.json(Array.from(agents.values())); });
 
-    for (const c of containers) {
-      const id = c.Labels["agent-id"];
-      if (id && agents.has(id)) {
-        agents.get(id).docker_status = c.State;
-      }
-    }
-
-    res.json(Array.from(agents.values()));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// --- GET /agents/:id ---
-app.get("/agents/:id", auth, async (req, res) => {
+app.get("/agents/:id", auth, (req, res) => {
   const agent = agents.get(req.params.id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
   res.json(agent);
 });
 
-// --- DELETE /agents/:id ---
 app.delete("/agents/:id", auth, async (req, res) => {
   try {
     const agent = agents.get(req.params.id);
     if (!agent) return res.status(404).json({ error: "Agent not found" });
-
     const container = docker.getContainer(agent.container_id);
     try { await container.stop(); } catch (_) {}
     await container.remove({ force: true });
     if (agent.port) releasePort(agent.port);
     agents.delete(req.params.id);
-
     res.json({ deleted: true, id: req.params.id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- POST /agents/:id/task - Send task (SSE streaming) ---
 app.post("/agents/:id/task", auth, async (req, res) => {
   const agent = agents.get(req.params.id);
   if (!agent) return res.status(404).json({ error: "Agent not found" });
-
   const { prompt, system_prompt, model, max_turns, allowedTools } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  const sendEvent = (event, data) => {
-    res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n");
-  };
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  const sendEvent = (event, data) => { res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n"); };
 
   try {
     const container = docker.getContainer(agent.container_id);
     const taskId = uuidv4().slice(0, 8);
-
     sendEvent("task.started", { task_id: taskId, agent_id: agent.id, prompt });
-
-    // Build claude command
-    let cmd = "claude -p";
-
-    const sysPrompt = system_prompt || agent.system_prompt;
-    if (sysPrompt) {
-      const sysB64 = Buffer.from(sysPrompt).toString("base64");
-      cmd += " --system-prompt \"$(echo " + sysB64 + " | base64 -d)\"";
-    }
-
-    if (model) cmd += " --model " + model;
-    if (max_turns) cmd += " --max-turns " + max_turns;
-
-    if (allowedTools && Array.isArray(allowedTools)) {
-      for (const tool of allowedTools) {
-        cmd += " --allowedTools " + tool;
-      }
-    }
-
-    // Encode prompt as base64 to avoid escaping issues
-    const promptB64 = Buffer.from(prompt).toString("base64");
-    cmd = "echo " + promptB64 + " | base64 -d | " + cmd;
-
-    sendEvent("task.executing", { task_id: taskId, command: cmd });
-
+    const cmd = buildClaudeCmd(prompt, system_prompt || agent.system_prompt, { model, max_turns, allowedTools });
     const fullOutput = await containerExecStream(container, cmd, (chunk) => {
       sendEvent("task.output", { task_id: taskId, text: chunk });
     });
-
     agent.tasks_completed++;
-
-    sendEvent("task.completed", {
-      task_id: taskId,
-      agent_id: agent.id,
-      output: fullOutput.trim(),
-    });
-  } catch (err) {
-    sendEvent("task.error", { error: err.message });
-  } finally {
-    res.end();
-  }
+    sendEvent("task.completed", { task_id: taskId, agent_id: agent.id, output: fullOutput.trim() });
+  } catch (err) { sendEvent("task.error", { error: err.message }); }
+  finally { res.end(); }
 });
 
-// --- POST /agents/:id/exec - Run command in container ---
 app.post("/agents/:id/exec", auth, async (req, res) => {
   try {
     const agent = agents.get(req.params.id);
     if (!agent) return res.status(404).json({ error: "Agent not found" });
-
-    const { command } = req.body;
-    if (!command) return res.status(400).json({ error: "command is required" });
-
     const container = docker.getContainer(agent.container_id);
-    const output = await containerExec(container, command);
-
+    const output = await containerExec(container, req.body.command);
     res.json({ output: output.trim(), agent_id: agent.id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- POST /agents/:id/upload - Upload file to container ---
 app.post("/agents/:id/upload", auth, async (req, res) => {
   try {
     const agent = agents.get(req.params.id);
     if (!agent) return res.status(404).json({ error: "Agent not found" });
-
     const { path: filePath, content } = req.body;
-    if (!filePath || content === undefined) {
-      return res.status(400).json({ error: "path and content are required" });
-    }
-
+    if (!filePath || content === undefined) return res.status(400).json({ error: "path and content required" });
     const container = docker.getContainer(agent.container_id);
-
     const dir = filePath.substring(0, filePath.lastIndexOf("/"));
     if (dir) await containerExec(container, "mkdir -p " + dir);
-
-    const contentB64 = Buffer.from(content).toString("base64");
-    await containerExec(container, "echo " + contentB64 + " | base64 -d > " + filePath);
-
+    const b64 = Buffer.from(content).toString("base64");
+    await containerExec(container, "echo " + b64 + " | base64 -d > " + filePath);
     res.json({ uploaded: true, path: filePath, agent_id: agent.id });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- POST /agents/:id/conversation - Multi-turn with --resume ---
-app.post("/agents/:id/conversation", auth, async (req, res) => {
-  const agent = agents.get(req.params.id);
-  if (!agent) return res.status(404).json({ error: "Agent not found" });
+// ============================================================
+//  HEALTH + RECOVERY
+// ============================================================
 
-  const { prompt, session_id } = req.body;
-  if (!prompt) return res.status(400).json({ error: "prompt is required" });
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  const sendEvent = (event, data) => {
-    res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n");
-  };
-
-  try {
-    const container = docker.getContainer(agent.container_id);
-
-    let cmd = "claude -p";
-    if (session_id) cmd += " --resume " + session_id;
-
-    const promptB64 = Buffer.from(prompt).toString("base64");
-    cmd = "echo " + promptB64 + " | base64 -d | " + cmd;
-
-    sendEvent("conversation.started", { agent_id: agent.id, session_id });
-
-    const fullOutput = await containerExecStream(container, cmd, (chunk) => {
-      sendEvent("conversation.output", { text: chunk });
-    });
-
-    sendEvent("conversation.completed", { output: fullOutput.trim() });
-  } catch (err) {
-    sendEvent("conversation.error", { error: err.message });
-  } finally {
-    res.end();
-  }
-});
-
-// --- GET /health ---
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "claude-agents",
-    agents_count: agents.size,
-    uptime: process.uptime(),
-  });
+  res.json({ status: "ok", service: "claude-agents", agents_count: agents.size, groups_count: groups.size, uptime: process.uptime() });
 });
 
-// --- Recovery on startup ---
 async function recoverAgents() {
   try {
-    const containers = await docker.listContainers({
-      all: true,
-      filters: { label: ["claude-agents=true"] },
-    });
-
-    for (const c of containers) {
+    // Recover individual agents
+    const agentContainers = await docker.listContainers({ all: true, filters: { label: ["claude-agents=true"] } });
+    for (const c of agentContainers) {
       const id = c.Labels["agent-id"];
       const port = c.Labels["agent-port"] ? parseInt(c.Labels["agent-port"]) : null;
       if (id) {
         if (port) allocatedPorts.add(port);
-        const hostIp = HOST_IP === "0.0.0.0" ? require("os").networkInterfaces().eth0?.[0]?.address || "localhost" : HOST_IP;
+        const hostIp = getHostIp();
         agents.set(id, {
-          id,
-          name: c.Labels["agent-name"] || "recovered-" + id,
+          id, name: c.Labels["agent-name"] || "recovered-" + id,
           container_name: c.Names[0] ? c.Names[0].replace("/", "") : "",
-          container_id: c.Id,
-          status: c.State === "running" ? "ready" : "stopped",
-          docker_status: c.State,
-          port,
+          container_id: c.Id, status: c.State === "running" ? "ready" : "stopped",
+          docker_status: c.State, port,
           publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
           dynamic_url: port ? "http://" + hostIp + ":" + port + "/" : null,
           created_at: c.Created ? new Date(c.Created * 1000).toISOString() : null,
-          tasks_completed: 0,
-          recovered: true,
+          tasks_completed: 0, recovered: true,
         });
       }
     }
-    console.log("Recovered " + agents.size + " agents from Docker");
-  } catch (err) {
-    console.error("Recovery failed:", err.message);
-  }
+
+    // Recover groups
+    const groupContainers = await docker.listContainers({ all: true, filters: { label: ["claude-groups=true"] } });
+    for (const c of groupContainers) {
+      const id = c.Labels["group-id"];
+      const port = c.Labels["group-port"] ? parseInt(c.Labels["group-port"]) : null;
+      if (id) {
+        if (port) allocatedPorts.add(port);
+        const hostIp = getHostIp();
+        groups.set(id, {
+          id, name: c.Labels["group-name"] || "recovered-" + id,
+          container_name: c.Names[0] ? c.Names[0].replace("/", "") : "",
+          container_id: c.Id, status: c.State === "running" ? "ready" : "stopped",
+          members: [], port,
+          publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
+          dynamic_url: port ? "http://" + hostIp + ":" + port + "/" : null,
+          created_at: c.Created ? new Date(c.Created * 1000).toISOString() : null,
+          tasks_completed: 0, recovered: true,
+        });
+      }
+    }
+
+    console.log("Recovered " + agents.size + " agents, " + groups.size + " groups");
+  } catch (err) { console.error("Recovery failed:", err.message); }
 }
 
 recoverAgents().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
     console.log("");
     console.log("Claude Agents API running on port " + PORT);
-    console.log("  Agents: " + agents.size);
+    console.log("  Agents: " + agents.size + " | Groups: " + groups.size);
     console.log("  Image: " + IMAGE_NAME);
-    console.log("  Credentials: " + CREDENTIALS_PATH);
     console.log("");
   });
 });
