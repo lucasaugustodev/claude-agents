@@ -211,9 +211,20 @@ async function containerExecStreamWithRetry(container, command, onData) {
 // --- Inject credentials into a container ---
 async function injectCredentials(container) {
   const credentials = fs.readFileSync(CREDENTIALS_PATH, "utf8");
-  await containerExec(container, "mkdir -p /root/.claude");
+  await containerExec(container, "mkdir -p /home/agent/.claude");
   const credB64 = Buffer.from(credentials).toString("base64");
-  await containerExec(container, "echo " + credB64 + " | base64 -d > /root/.claude/.credentials.json");
+  await containerExec(container, "echo " + credB64 + " | base64 -d > /home/agent/.claude/.credentials.json");
+
+  // Inject settings.json with bypassPermissions mode
+  const settings = JSON.stringify({
+    permissions: {
+      defaultMode: "bypassPermissions",
+      allow: ["Bash(*)", "Write(*)", "Edit(*)", "Read(*)", "WebFetch(*)", "WebSearch"],
+    },
+    hasCompletedOnboarding: true,
+  });
+  const settingsB64 = Buffer.from(settings).toString("base64");
+  await containerExec(container, "echo " + settingsB64 + " | base64 -d > /home/agent/.claude/settings.json");
 }
 
 // --- Build publish instructions ---
@@ -275,7 +286,7 @@ NEVER hardcode credentials. Always read from this file.
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "claude-opus-4-7";
 
 function buildClaudeCmd(prompt, systemPrompt, options = {}) {
-  let cmd = "claude -p --dangerously-skip-permissions";
+  let cmd = "claude -p --permission-mode bypassPermissions";
   if (systemPrompt) {
     const sysB64 = Buffer.from(systemPrompt).toString("base64");
     cmd += ' --system-prompt "$(echo ' + sysB64 + ' | base64 -d)"';
