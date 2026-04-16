@@ -278,7 +278,8 @@ function buildClaudeCmd(prompt, systemPrompt, options = {}) {
 // Returns { text, toolUses } and calls onEvent for each stream event
 async function parseClaudeStream(container, command, onEvent) {
   let buffer = "";
-  let fullText = "";
+  let resultText = ""; // final result.result (authoritative)
+  const streamedTexts = []; // track each text block streamed
   const toolUses = [];
 
   const rawOutput = await containerExecStreamWithRetry(container, command, (chunk) => {
@@ -293,7 +294,7 @@ async function parseClaudeStream(container, command, onEvent) {
         if (evt.type === "assistant" && evt.message?.content) {
           for (const block of evt.message.content) {
             if (block.type === "text" && block.text) {
-              fullText += block.text;
+              streamedTexts.push(block.text);
               onEvent({ type: "text", text: block.text });
             } else if (block.type === "tool_use") {
               toolUses.push({ name: block.name, input: block.input });
@@ -303,28 +304,28 @@ async function parseClaudeStream(container, command, onEvent) {
         } else if (evt.type === "user" && evt.message?.content) {
           for (const block of evt.message.content) {
             if (block.type === "tool_result") {
-              const resultText = typeof block.content === "string"
+              const rt = typeof block.content === "string"
                 ? block.content
                 : Array.isArray(block.content)
                   ? block.content.map(c => c.text || "").join("")
                   : "";
-              onEvent({ type: "tool_result", output: resultText.slice(0, 2000) });
+              onEvent({ type: "tool_result", output: rt.slice(0, 2000) });
             }
           }
         } else if (evt.type === "result") {
-          if (evt.result && !fullText) fullText = evt.result;
+          if (evt.result) resultText = evt.result;
           onEvent({ type: "result", duration_ms: evt.duration_ms, cost: evt.total_cost_usd });
         }
       } catch (_) {}
     }
   });
 
-  // If fullText is empty but rawOutput has content, use rawOutput (fallback)
-  if (!fullText && rawOutput) {
-    // Try to extract a final message from whatever we got
-    fullText = rawOutput.slice(0, 4000);
-  }
-  return { text: fullText, toolUses };
+  // Prefer the authoritative result text from the `result` event.
+  // Fallback to the LAST streamed text (not concatenation — that produces duplicates when Claude repeats itself across turns).
+  let finalText = resultText;
+  if (!finalText && streamedTexts.length > 0) finalText = streamedTexts[streamedTexts.length - 1];
+  if (!finalText && rawOutput) finalText = rawOutput.slice(0, 4000);
+  return { text: finalText, toolUses };
 }
 
 // ============================================================
