@@ -463,7 +463,7 @@ ${memoryContext}`;
     sendEvent("orchestrate.started", { group_id: group.id, prompt });
 
     // Step 1: Ask orchestrator to plan
-    const planCmd = buildClaudeCmd(prompt, orchestratorPrompt, { max_turns: "1" });
+    const planCmd = buildClaudeCmd(prompt, orchestratorPrompt, { max_turns: "5" });
     const plan = await containerExecStream(container, planCmd, (chunk) => {
       sendEvent("orchestrate.planning", { text: chunk });
     });
@@ -523,7 +523,7 @@ ${memoryContext}`;
         results.map(r => "## " + r.agent_name + "\n" + r.output).join("\n\n") +
         "\n\nSummarize what was accomplished, list any URLs or deliverables, and note if anything needs follow-up.";
 
-      const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Synthesize team results concisely. Include all URLs and deliverables.", { max_turns: "1" });
+      const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Synthesize team results concisely. Include all URLs and deliverables.", { max_turns: "5" });
 
       const synthesis = await containerExecStream(container, synthesisCmd, (chunk) => {
         sendEvent("orchestrate.synthesis", { text: chunk });
