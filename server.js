@@ -12,11 +12,37 @@ const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 const PORT = process.env.PORT || 3100;
 const API_SECRET = process.env.API_SECRET || "claude-agents-secret-2026";
 const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH || "/root/.claude/.credentials.json";
+const HOST_IP = process.env.HOST_IP || "0.0.0.0";
+const DEPLOYS_DIR = process.env.DEPLOYS_DIR || "/opt/deploys";
 const IMAGE_NAME = "claude-agent:latest";
 const CONTAINER_PREFIX = "claude-agent-";
+const PORT_RANGE_START = 9000;
+const PORT_RANGE_END = 9999;
 
 // In-memory agent registry
 const agents = new Map();
+const allocatedPorts = new Set();
+
+// --- Port allocation ---
+function allocatePort() {
+  for (let p = PORT_RANGE_START; p <= PORT_RANGE_END; p++) {
+    if (!allocatedPorts.has(p)) {
+      allocatedPorts.add(p);
+      return p;
+    }
+  }
+  throw new Error("No available ports in range " + PORT_RANGE_START + "-" + PORT_RANGE_END);
+}
+
+function releasePort(port) {
+  allocatedPorts.delete(port);
+}
+
+// --- Ensure deploys directory exists ---
+try { fs.mkdirSync(DEPLOYS_DIR, { recursive: true }); } catch (_) {}
+
+// --- Static file serving for /publish volumes ---
+app.use("/sites", express.static(DEPLOYS_DIR));
 
 // --- Auth middleware ---
 function auth(req, res, next) {
@@ -71,14 +97,44 @@ async function containerExecStream(container, command, onData) {
   });
 }
 
+// --- Build the system prompt injection for publish/port awareness ---
+function buildPublishInstructions(id, agentPort, hostIp) {
+  return `
+
+IMPORTANT - Publishing capabilities:
+You have two ways to make your work accessible externally:
+
+1. STATIC FILES (websites, landing pages, HTML files):
+   Save files to /publish/ directory. They are automatically served at:
+   http://${hostIp}:${PORT}/sites/${id}/
+   Example: save /publish/index.html -> accessible at http://${hostIp}:${PORT}/sites/${id}/index.html
+
+2. DYNAMIC APPS (Node servers, APIs, Python apps):
+   Your dedicated port is ${agentPort}. Start your server on port ${agentPort} inside the container.
+   It will be accessible externally at: http://${hostIp}:${agentPort}/
+   Example: express app listening on port ${agentPort} -> accessible at http://${hostIp}:${agentPort}/
+
+Always prefer /publish/ for static content. Use the dynamic port only when you need a running server.
+When you create something accessible, always tell the user the full URL where they can see it.
+`;
+}
+
 // --- POST /agents - Create a new agent ---
 app.post("/agents", auth, async (req, res) => {
   try {
     const { name, system_prompt } = req.body;
     const id = uuidv4().slice(0, 8);
     const containerName = CONTAINER_PREFIX + id;
+    const agentPort = allocatePort();
+
+    // Create host publish directory for this agent
+    const agentDeployDir = DEPLOYS_DIR + "/" + id;
+    fs.mkdirSync(agentDeployDir, { recursive: true });
 
     const credentials = fs.readFileSync(CREDENTIALS_PATH, "utf8");
+
+    // Determine host IP for URLs
+    const hostIp = HOST_IP === "0.0.0.0" ? require("os").networkInterfaces().eth0?.[0]?.address || "localhost" : HOST_IP;
 
     const container = await docker.createContainer({
       Image: IMAGE_NAME,
@@ -87,16 +143,28 @@ app.post("/agents", auth, async (req, res) => {
       Env: [
         "AGENT_ID=" + id,
         "AGENT_NAME=" + (name || "agent-" + id),
+        "AGENT_PORT=" + agentPort,
+        "PUBLISH_DIR=/publish",
       ],
+      ExposedPorts: {
+        [agentPort + "/tcp"]: {},
+      },
       HostConfig: {
         Memory: 2 * 1024 * 1024 * 1024,
         CpuShares: 512,
         RestartPolicy: { Name: "unless-stopped" },
+        Binds: [
+          agentDeployDir + ":/publish",
+        ],
+        PortBindings: {
+          [agentPort + "/tcp"]: [{ HostPort: String(agentPort) }],
+        },
       },
       Labels: {
         "claude-agents": "true",
         "agent-id": id,
         "agent-name": name || "agent-" + id,
+        "agent-port": String(agentPort),
       },
     });
 
@@ -104,8 +172,6 @@ app.post("/agents", auth, async (req, res) => {
 
     // Inject credentials
     await containerExec(container, "mkdir -p /root/.claude");
-
-    // Write credentials as base64 to avoid escaping issues
     const credB64 = Buffer.from(credentials).toString("base64");
     await containerExec(container, "echo " + credB64 + " | base64 -d > /root/.claude/.credentials.json");
 
@@ -113,13 +179,20 @@ app.post("/agents", auth, async (req, res) => {
     const verify = await containerExec(container, 'echo "respond with exactly: AGENT_READY" | claude -p 2>&1');
     const isReady = verify.includes("AGENT_READY");
 
+    // Build combined system prompt with publish instructions
+    const publishInstructions = buildPublishInstructions(id, agentPort, hostIp);
+    const fullSystemPrompt = (system_prompt || "") + publishInstructions;
+
     const agent = {
       id,
       name: name || "agent-" + id,
       container_name: containerName,
       container_id: container.id,
       status: isReady ? "ready" : "auth_pending",
-      system_prompt: system_prompt || null,
+      system_prompt: fullSystemPrompt,
+      port: agentPort,
+      publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
+      dynamic_url: "http://" + hostIp + ":" + agentPort + "/",
       created_at: new Date().toISOString(),
       tasks_completed: 0,
     };
@@ -169,6 +242,7 @@ app.delete("/agents/:id", auth, async (req, res) => {
     const container = docker.getContainer(agent.container_id);
     try { await container.stop(); } catch (_) {}
     await container.remove({ force: true });
+    if (agent.port) releasePort(agent.port);
     agents.delete(req.params.id);
 
     res.json({ deleted: true, id: req.params.id });
@@ -349,7 +423,10 @@ async function recoverAgents() {
 
     for (const c of containers) {
       const id = c.Labels["agent-id"];
+      const port = c.Labels["agent-port"] ? parseInt(c.Labels["agent-port"]) : null;
       if (id) {
+        if (port) allocatedPorts.add(port);
+        const hostIp = HOST_IP === "0.0.0.0" ? require("os").networkInterfaces().eth0?.[0]?.address || "localhost" : HOST_IP;
         agents.set(id, {
           id,
           name: c.Labels["agent-name"] || "recovered-" + id,
@@ -357,6 +434,9 @@ async function recoverAgents() {
           container_id: c.Id,
           status: c.State === "running" ? "ready" : "stopped",
           docker_status: c.State,
+          port,
+          publish_url: "http://" + hostIp + ":" + PORT + "/sites/" + id + "/",
+          dynamic_url: port ? "http://" + hostIp + ":" + port + "/" : null,
           created_at: c.Created ? new Date(c.Created * 1000).toISOString() : null,
           tasks_completed: 0,
           recovered: true,
