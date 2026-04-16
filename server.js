@@ -390,7 +390,7 @@ ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}`;
 
         try {
           const taskCmd = buildClaudeCmd(d.task, member.system_prompt, {
-            max_turns: "10",
+            max_turns: "50",
             allowedTools: ["Bash", "Write", "Edit", "Read"],
           });
 
