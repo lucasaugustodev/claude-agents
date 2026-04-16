@@ -17,11 +17,100 @@ const DEPLOYS_DIR = process.env.DEPLOYS_DIR || "/opt/deploys";
 const CLOUD_API_URL = process.env.CLOUD_API_URL || "http://127.0.0.1:9090";
 const CLOUD_API_SECRET = process.env.CLOUD_API_SECRET || "agentify-cloud-secret-2026";
 const DOMAIN = process.env.DOMAIN || "agentsfy.cc";
+const MEMPALACE_URL = process.env.MEMPALACE_URL || "http://127.0.0.1:8100";
 const IMAGE_NAME = "claude-agent:latest";
 const CONTAINER_PREFIX = "claude-agent-";
 const GROUP_PREFIX = "claude-group-";
 const PORT_RANGE_START = 9000;
 const PORT_RANGE_END = 9999;
+
+// ============================================================
+//  MEMORY SYSTEM — 3 scopes: agent, group, user
+// ============================================================
+
+async function mempalaceFetch(path, body) {
+  try {
+    const res = await fetch(MEMPALACE_URL + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return await res.json();
+  } catch (err) {
+    console.error("MemPalace error:", err.message);
+    return null;
+  }
+}
+
+async function storeMemory(tenantType, tenantId, content, wing, room, tags) {
+  return mempalaceFetch("/api/memories", {
+    tenant_type: tenantType,
+    tenant_id: tenantId,
+    content,
+    wing: wing || "general",
+    room: room || "auto",
+    tags: tags || [],
+  });
+}
+
+async function searchMemory(tenantType, tenantId, query, limit) {
+  return mempalaceFetch("/api/memories/search", {
+    tenant_type: tenantType,
+    tenant_id: tenantId,
+    query,
+    n_results: limit || 5,
+  });
+}
+
+async function searchMultiMemory(tenants, query, limit) {
+  return mempalaceFetch("/api/memories/search-multi", {
+    tenants,
+    query,
+    limit: limit || 5,
+  });
+}
+
+// Fetch all relevant memories for a task (3 scopes merged)
+async function getMemoryContext(agentName, groupId, userId, prompt) {
+  const tenants = [];
+  if (agentName) tenants.push({ type: "agent", id: agentName });
+  if (groupId) tenants.push({ type: "group", id: groupId });
+  if (userId) tenants.push({ type: "user", id: userId });
+
+  if (tenants.length === 0 || !prompt) return "";
+
+  const result = await searchMultiMemory(tenants, prompt, 8);
+  if (!result || !result.results || result.results.length === 0) {
+    console.log("[Memory] No results for query:", prompt.slice(0, 50));
+    return "";
+  }
+
+  console.log("[Memory] Got " + result.results.length + " results, filtering by similarity >= 0.15");
+  const memories = result.results
+    .filter(r => (r.similarity || r.score || 0) >= 0.15)
+    .map(r => "- [" + r.tenant_type + "/" + r.wing + "] " + (r.text || r.content))
+    .join("\n");
+
+  if (!memories) return "";
+  return "\n\n[RELEVANT MEMORIES from previous interactions]\n" + memories + "\n[END MEMORIES]\n";
+}
+
+// Auto-save key output as memory after task completion
+async function autoSaveMemory(agentName, groupId, userId, prompt, output) {
+  if (!output || output.length < 80) return;
+
+  // Save to agent scope
+  if (agentName) {
+    const summary = output.length > 500 ? output.slice(0, 500) + "..." : output;
+    await storeMemory("agent", agentName, "Task: " + prompt.slice(0, 100) + "\nResult: " + summary, "tasks", "auto", []);
+  }
+
+  // Save to group scope
+  if (groupId) {
+    const summary = output.length > 500 ? output.slice(0, 500) + "..." : output;
+    await storeMemory("group", groupId, "[" + (agentName || "agent") + "] " + prompt.slice(0, 100) + " → " + summary, "activity", "auto", []);
+  }
+}
 
 // In-memory registries
 const agents = new Map();
@@ -269,12 +358,15 @@ app.post("/groups/:id/task", auth, async (req, res) => {
   const group = groups.get(req.params.id);
   if (!group) return res.status(404).json({ error: "Group not found" });
 
-  const { agent_name, prompt, system_prompt, model, max_turns, allowedTools } = req.body;
+  const { agent_name, prompt, system_prompt, model, max_turns, allowedTools, user_id } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
 
   // Find agent in group
   const member = agent_name ? group.members.find(m => m.name === agent_name || m.id === agent_name) : null;
-  const sysPrompt = system_prompt || (member ? member.system_prompt : null);
+
+  // Inject memory context (3 scopes: agent + group + user)
+  const memoryContext = await getMemoryContext(agent_name, group.id, user_id, prompt);
+  const sysPrompt = (system_prompt || (member ? member.system_prompt : null) || "") + memoryContext;
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -300,6 +392,10 @@ app.post("/groups/:id/task", auth, async (req, res) => {
     });
 
     group.tasks_completed++;
+
+    // Auto-save memories (agent + group scopes)
+    autoSaveMemory(agent_name, group.id, user_id, prompt, fullOutput.trim());
+
     sendEvent("task.completed", { task_id: taskId, agent_name: agent_name || "default", output: fullOutput.trim() });
   } catch (err) {
     sendEvent("task.error", { error: err.message });
@@ -313,8 +409,11 @@ app.post("/groups/:id/orchestrate", auth, async (req, res) => {
   const group = groups.get(req.params.id);
   if (!group) return res.status(404).json({ error: "Group not found" });
 
-  const { prompt, context } = req.body;
+  const { prompt, context, user_id } = req.body;
   if (!prompt) return res.status(400).json({ error: "prompt is required" });
+
+  // Inject group + user memory context into orchestrator
+  const memoryContext = await getMemoryContext("orchestrator", group.id, user_id, prompt);
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -358,7 +457,8 @@ SCHEDULE:
 END_SCHEDULE
 
 Keep delegations specific and actionable. Include file paths, tech stack preferences, and coordination instructions.
-${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}`;
+${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}
+${memoryContext}`;
 
     sendEvent("orchestrate.started", { group_id: group.id, prompt });
 
@@ -389,7 +489,11 @@ ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}`;
         sendEvent("agent.started", { agent_name: d.agent_name, task: d.task });
 
         try {
-          const taskCmd = buildClaudeCmd(d.task, member.system_prompt, {
+          // Inject agent-specific memory
+          const agentMemory = await getMemoryContext(d.agent_name, group.id, user_id, d.task);
+          const agentSysPrompt = member.system_prompt + agentMemory;
+
+          const taskCmd = buildClaudeCmd(d.task, agentSysPrompt, {
             max_turns: "50",
             allowedTools: ["Bash", "Write", "Edit", "Read"],
           });
@@ -397,6 +501,9 @@ ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}`;
           const output = await containerExecStream(container, taskCmd, (chunk) => {
             sendEvent("agent.output", { agent_name: d.agent_name, text: chunk });
           });
+
+          // Auto-save agent + group memories
+          autoSaveMemory(d.agent_name, group.id, user_id, d.task, output.trim());
 
           sendEvent("agent.completed", { agent_name: d.agent_name, output: output.trim() });
           return { agent_name: d.agent_name, output: output.trim() };
@@ -438,6 +545,9 @@ ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}`;
     }
 
     group.tasks_completed++;
+
+    // Auto-save orchestration summary to group memory
+    autoSaveMemory("orchestrator", group.id, user_id, prompt, plan.trim());
   } catch (err) {
     sendEvent("orchestrate.error", { error: err.message });
   } finally {
@@ -612,6 +722,98 @@ app.post("/agents/:id/upload", auth, async (req, res) => {
     await containerExec(container, "echo " + b64 + " | base64 -d > " + filePath);
     res.json({ uploaded: true, path: filePath, agent_id: agent.id });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================================
+//  MEMORY API — query/store across 3 scopes
+// ============================================================
+
+// --- POST /memory/store ---
+app.post("/memory/store", auth, async (req, res) => {
+  const { tenant_type, tenant_id, content, wing, room, tags } = req.body;
+  if (!tenant_type || !tenant_id || !content) {
+    return res.status(400).json({ error: "tenant_type, tenant_id, content required" });
+  }
+  const result = await storeMemory(tenant_type, tenant_id, content, wing, room, tags);
+  res.json(result || { error: "MemPalace unavailable" });
+});
+
+// --- POST /memory/search ---
+app.post("/memory/search", auth, async (req, res) => {
+  const { tenant_type, tenant_id, query, limit } = req.body;
+  if (!query) return res.status(400).json({ error: "query required" });
+
+  if (tenant_type && tenant_id) {
+    const result = await searchMemory(tenant_type, tenant_id, query, limit);
+    return res.json(result || { results: [] });
+  }
+
+  // Multi-scope search
+  const { agent_name, group_id, user_id } = req.body;
+  const tenants = [];
+  if (agent_name) tenants.push({ type: "agent", id: agent_name });
+  if (group_id) tenants.push({ type: "group", id: group_id });
+  if (user_id) tenants.push({ type: "user", id: user_id });
+
+  if (tenants.length === 0) return res.status(400).json({ error: "specify tenant_type+tenant_id or agent_name/group_id/user_id" });
+
+  const result = await searchMultiMemory(tenants, query, limit);
+  res.json(result || { results: [] });
+});
+
+// --- GET /memory/list ---
+app.get("/memory/list", auth, async (req, res) => {
+  const { tenant_type, tenant_id, wing, limit } = req.query;
+  if (!tenant_type || !tenant_id) return res.status(400).json({ error: "tenant_type and tenant_id required" });
+
+  try {
+    const url = new URL(MEMPALACE_URL + "/api/memories/list");
+    url.searchParams.set("tenant_type", tenant_type);
+    url.searchParams.set("tenant_id", tenant_id);
+    if (wing) url.searchParams.set("wing", wing);
+    if (limit) url.searchParams.set("limit", limit);
+
+    const r = await fetch(url.toString());
+    const data = await r.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- GET /groups/:id/memories — List all memories for a group (agents + group scope) ---
+app.get("/groups/:id/memories", auth, async (req, res) => {
+  const group = groups.get(req.params.id);
+  if (!group) return res.status(404).json({ error: "Group not found" });
+
+  try {
+    // Get group-scope memories
+    const groupUrl = new URL(MEMPALACE_URL + "/api/memories/list");
+    groupUrl.searchParams.set("tenant_type", "group");
+    groupUrl.searchParams.set("tenant_id", group.id);
+    groupUrl.searchParams.set("limit", "50");
+    const groupRes = await fetch(groupUrl.toString());
+    const groupData = await groupRes.json();
+
+    // Get per-agent memories
+    const agentMemories = {};
+    for (const m of group.members) {
+      const agentUrl = new URL(MEMPALACE_URL + "/api/memories/list");
+      agentUrl.searchParams.set("tenant_type", "agent");
+      agentUrl.searchParams.set("tenant_id", m.name);
+      agentUrl.searchParams.set("limit", "20");
+      const agentRes = await fetch(agentUrl.toString());
+      const agentData = await agentRes.json();
+      agentMemories[m.name] = agentData.memories || [];
+    }
+
+    res.json({
+      group_memories: groupData.memories || [],
+      agent_memories: agentMemories,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ============================================================
