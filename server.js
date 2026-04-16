@@ -261,7 +261,13 @@ IMPORTANT RULES:
 - Use /workspace/shared/ for files that other agents in this group need to access.
 - Your personal workspace is /workspace/<your-name> but you can read/write anywhere in /workspace.
 
-=== END DEPLOY SYSTEM ===
+=== CREDENTIALS ===
+User API keys and credentials are stored in /workspace/shared/credentials.json
+Read this file when you need API keys, tokens, or secrets for external services (Bitrix, GitHub, etc).
+Format: {"key_name": "key_value", ...}
+NEVER hardcode credentials. Always read from this file.
+
+=== END SYSTEM ===
 `;
 }
 
