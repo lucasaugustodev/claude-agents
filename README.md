@@ -1,33 +1,43 @@
 # Claude Agents
 
-Managed Agents platform that runs isolated Claude Code instances inside Docker containers, each pre-authenticated and ready to receive tasks via a REST API with SSE streaming.
+Managed Agents platform that runs Claude Code instances inside Docker containers, pre-authenticated and ready to receive tasks via a REST API with SSE streaming.
 
-Think of it as **Claude Code as a Service** — create agents on demand, send them tasks, and stream results in real-time. Each agent lives in its own container with full filesystem isolation, its own Claude Code session, and resource limits.
+Two modes of operation:
+
+- **Individual Agents** — 1 container per agent, full isolation
+- **Groups** (recommended) — 1 container shared by N agents with a shared `/workspace` filesystem and built-in orchestrator that delegates tasks, coordinates parallel work, and synthesizes results
 
 ## How it works
 
+### Groups (recommended)
+
 ```
-Client (your app, CLI, frontend)
+Client
   |
-  |  POST /agents          → Create agent (Docker container + Claude Code)
-  |  POST /agents/:id/task → Send task (SSE streaming response)
-  |  DELETE /agents/:id    → Destroy agent
+  |  POST /groups              → Create group (1 container, N agents)
+  |  POST /groups/:id/orchestrate → Send request (orchestrator delegates + synthesizes)
   v
-Claude Agents API (Node.js, port 3100)
+Claude Agents API (Node.js)
   |
   |  dockerode → Docker Engine
-  |  Creates container from claude-agent:latest image
-  |  Injects OAuth credentials (base64)
-  |  Executes: echo <prompt> | claude -p
+  |  1 container for the whole group
+  |  Shared /workspace filesystem
+  |  Orchestrator plans → delegates to agents → synthesizes
   v
-Docker Container (isolated)
-  |  - Node.js 20
-  |  - Claude Code CLI (pre-authenticated)
-  |  - 2GB RAM limit, CPU shares
-  |  - Independent filesystem (/workspace)
+Docker Container (shared)
+  |  - Node.js 20 + Claude Code CLI
+  |  - 4GB RAM, shared CPU
+  |  - /workspace (all agents read/write)
+  |  - /publish (auto-served static files)
+  |  - Dedicated port (dynamic apps)
   v
 Claude API (Anthropic)
-  Uses OAuth token from ~/.claude/.credentials.json
+```
+
+### Individual Agents (legacy)
+
+```
+Client → POST /agents → 1 container per agent → Claude API
 ```
 
 ## Authentication — How Claude Code CLI Auth Works
@@ -285,22 +295,103 @@ curl -X POST http://localhost:3100/agents/cf886e56/upload \
   }'
 ```
 
+## Groups API Reference
+
+### `POST /groups`
+
+Create a group — 1 Docker container with N agents sharing `/workspace`.
+
+```bash
+curl -X POST http://localhost:3100/groups \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-secret" \
+  -d '{
+    "name": "web-team",
+    "description": "Frontend + Backend team",
+    "members": [
+      {"name": "frontend", "role": "Frontend Developer", "system_prompt": "You are a frontend expert."},
+      {"name": "backend", "role": "Backend Developer", "system_prompt": "You are a Node.js expert."}
+    ]
+  }'
+```
+
+Response includes `publish_url`, `dynamic_url`, and `production_url` (subdomain).
+
+### `POST /groups/:id/orchestrate`
+
+Send a request to the group. The orchestrator analyzes, delegates to agents in parallel, and synthesizes results. Returns SSE stream.
+
+```bash
+curl -N -X POST http://localhost:3100/groups/abc123/orchestrate \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-secret" \
+  -d '{"prompt": "Create a landing page with a REST API backend"}'
+```
+
+**SSE Events:**
+
+| Event | Description |
+|-------|-------------|
+| `orchestrate.started` | Request received |
+| `orchestrate.planning` | Orchestrator analyzing and planning (streaming) |
+| `orchestrate.plan_ready` | Plan complete, includes DELEGATE block |
+| `orchestrate.delegating` | Tasks being dispatched to agents |
+| `agent.started` | Agent began working on task |
+| `agent.output` | Streaming output from agent |
+| `agent.completed` | Agent finished task |
+| `orchestrate.synthesis` | Orchestrator synthesizing results |
+| `orchestrate.completed` | All done, includes full synthesis |
+| `schedule.created` | Recurring schedule detected and created |
+
+### `POST /groups/:id/task`
+
+Send a task to a specific agent in the group (bypasses orchestrator).
+
+```bash
+curl -N -X POST http://localhost:3100/groups/abc123/task \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-secret" \
+  -d '{"agent_name": "frontend", "prompt": "Add a dark mode toggle"}'
+```
+
+### `POST /groups/:id/members`
+
+Add a new member to an existing group.
+
+### `DELETE /groups/:id/members/:name`
+
+Remove a member from a group.
+
+### `GET /groups` | `GET /groups/:id` | `DELETE /groups/:id`
+
+List, get details, or destroy a group.
+
+## Publishing & Deploy
+
+Every agent (individual or in a group) gets three ways to publish:
+
+| Method | How | URL |
+|--------|-----|-----|
+| **Static** | Save to `/publish/` | `http://HOST:PORT/sites/{id}/` |
+| **Dynamic** | Start server on dedicated port | `http://HOST:{port}/` |
+| **Production** | Register subdomain via Container Manager | `https://{name}.agentsfy.cc` |
+
+Agents are taught these capabilities via injected system prompts — they publish automatically when asked.
+
 ## Container Specs
 
-Each agent container runs with:
-
-| Resource | Limit |
-|----------|-------|
-| Memory | 2 GB |
-| CPU Shares | 512 |
-| Base Image | `node:20-slim` |
-| Installed | Claude Code CLI, git, curl |
-| Restart Policy | `unless-stopped` |
-| Working Dir | `/workspace` |
+| Resource | Individual Agent | Group |
+|----------|-----------------|-------|
+| Memory | 2 GB | 4 GB |
+| CPU Shares | 512 | 1024 |
+| Base Image | `node:20-slim` | `node:20-slim` |
+| Installed | Claude Code CLI, git, curl | Same |
+| Filesystem | `/workspace` (isolated) | `/workspace` (shared by all agents) |
+| Publish | `/publish` (volume mount) | `/publish` (volume mount) |
 
 ## Recovery
 
-On startup, the API scans Docker for existing containers with the `claude-agents=true` label and re-registers them. This means the API can restart without losing track of running agents.
+On startup, the API scans Docker for containers with `claude-agents=true` or `claude-groups=true` labels and re-registers them.
 
 ## License
 
