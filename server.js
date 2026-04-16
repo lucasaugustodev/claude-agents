@@ -231,56 +231,27 @@ async function injectCredentials(container) {
 function buildPublishInstructions(groupId, agentPort, subdomain) {
   return `
 
-=== AGENTSFY TOOLS ===
+=== ENVIRONMENT ===
+Docker container on Agentsfy. Shared filesystem: /workspace. App port: ${agentPort}.
+Read context: cat /workspace/shared/context.json (api_url, api_token, conversation_id, user_id)
+Read credentials: cat /workspace/shared/credentials.json — NEVER hardcode secrets.
 
-You are inside a Docker container in the Agentsfy platform. All agents in this group share /workspace.
-Your dedicated port for running apps is ${agentPort}.
+=== PLATFORM TOOLS ===
+API_URL=$(jq -r .api_url /workspace/shared/context.json)
+API_TOKEN=$(jq -r .api_token /workspace/shared/context.json)
+CONV_ID=$(jq -r .conversation_id /workspace/shared/context.json)
 
-READ YOUR CONTEXT FIRST:
-  cat /workspace/shared/context.json
-  # Contains: api_url, api_token, conversation_id, user_id, group_members
+curl -s -X POST "$API_URL/api/tools/<name>" -H "x-api-token: $API_TOKEN" -H "Content-Type: application/json" -d '{"conversation_id":"'$CONV_ID'", ...args}'
 
-USER CREDENTIALS (API keys, tokens):
-  cat /workspace/shared/credentials.json
-  # Format: {"bitrix_api_key": "...", "github_token": "...", ...}
-  NEVER hardcode secrets. Always read from here.
+Tools: schedule_create, deploy_app, credential_get, memory_search, memory_store, project_file_read/write, github_create_repo. Full schema: GET /api/tools.
 
-=== INVOKING TOOLS ===
-
-To use a platform tool, call:
-  API_URL=$(jq -r .api_url /workspace/shared/context.json)
-  API_TOKEN=$(jq -r .api_token /workspace/shared/context.json)
-  CONV_ID=$(jq -r .conversation_id /workspace/shared/context.json)
-
-  curl -s -X POST "$API_URL/api/tools/<tool_name>" \\
-    -H "x-api-token: $API_TOKEN" \\
-    -H "Content-Type: application/json" \\
-    -d '{"conversation_id":"'$CONV_ID'", ...args}'
-
-Discover all tools with schemas:
-  curl -s "$API_URL/api/tools" | jq
-
-=== KEY TOOLS ===
-
-- schedule_create  — recurring task (args: cron, name, prompt)
-- schedule_list    — list schedules in this conversation
-- deploy_app       — publish app from /publish to production subdomain
-- credential_get   — fetch a user credential by name
-- memory_search    — search user memories semantically
-- memory_store     — save a memory
-- project_file_read / project_file_write — read/write files in user's cloud container
-- github_create_repo — create a GitHub repo (uses github_token credential)
-
-WHEN TO USE EACH:
-- User asks for recurring task ("a cada X", "diariamente") → schedule_create
-- User asks to "deploy" / "publish" → deploy_app
-- You need an API key → credential_get
-- Building an app → save to /publish, then deploy_app
-
-=== RULES ===
-
-- Actually CALL the tools, do not fake responses or invent IDs.
-- Every tool returns JSON — check it before confirming success to the user.
+=== REPLY STYLE — BE BRIEF ===
+You are in a team chat. Keep messages SHORT (max 3 sentences unless explicitly asked for detail).
+- "Salvei N items em /path" — DON'T paste the content.
+- "Feito, ID: xyz" — DON'T paste the full JSON.
+- Skip emoji headers, markdown tables, "Follow-up" sections, greetings/closings.
+- If you failed, say what failed in one line and one fix suggestion.
+- Actually CALL the tools, don't fake IDs.
 - The schedule runs inside THIS group container — your team agents execute the task when it fires.
 `;
 }
@@ -289,7 +260,7 @@ WHEN TO USE EACH:
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || "claude-opus-4-7";
 
 function buildClaudeCmd(prompt, systemPrompt, options = {}) {
-  let cmd = "claude -p --permission-mode bypassPermissions";
+  let cmd = "claude -p --permission-mode bypassPermissions --output-format stream-json --verbose";
   if (systemPrompt) {
     const sysB64 = Buffer.from(systemPrompt).toString("base64");
     cmd += ' --system-prompt "$(echo ' + sysB64 + ' | base64 -d)"';
@@ -301,6 +272,59 @@ function buildClaudeCmd(prompt, systemPrompt, options = {}) {
   }
   const promptB64 = Buffer.from(prompt).toString("base64");
   return "echo " + promptB64 + " | base64 -d | " + cmd;
+}
+
+// Parse stream-json output from claude -p and emit structured events
+// Returns { text, toolUses } and calls onEvent for each stream event
+async function parseClaudeStream(container, command, onEvent) {
+  let buffer = "";
+  let fullText = "";
+  const toolUses = [];
+
+  const rawOutput = await containerExecStreamWithRetry(container, command, (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith("{")) continue;
+      try {
+        const evt = JSON.parse(trimmed);
+        if (evt.type === "assistant" && evt.message?.content) {
+          for (const block of evt.message.content) {
+            if (block.type === "text" && block.text) {
+              fullText += block.text;
+              onEvent({ type: "text", text: block.text });
+            } else if (block.type === "tool_use") {
+              toolUses.push({ name: block.name, input: block.input });
+              onEvent({ type: "tool_use", name: block.name, input: block.input });
+            }
+          }
+        } else if (evt.type === "user" && evt.message?.content) {
+          for (const block of evt.message.content) {
+            if (block.type === "tool_result") {
+              const resultText = typeof block.content === "string"
+                ? block.content
+                : Array.isArray(block.content)
+                  ? block.content.map(c => c.text || "").join("")
+                  : "";
+              onEvent({ type: "tool_result", output: resultText.slice(0, 2000) });
+            }
+          }
+        } else if (evt.type === "result") {
+          if (evt.result && !fullText) fullText = evt.result;
+          onEvent({ type: "result", duration_ms: evt.duration_ms, cost: evt.total_cost_usd });
+        }
+      } catch (_) {}
+    }
+  });
+
+  // If fullText is empty but rawOutput has content, use rawOutput (fallback)
+  if (!fullText && rawOutput) {
+    // Try to extract a final message from whatever we got
+    fullText = rawOutput.slice(0, 4000);
+  }
+  return { text: fullText, toolUses };
 }
 
 // ============================================================
@@ -465,8 +489,10 @@ app.post("/groups/:id/task", auth, async (req, res) => {
 
     const cmd = buildClaudeCmd(prompt, sysPrompt, { model, max_turns, allowedTools });
 
-    const fullOutput = await containerExecStreamWithRetry(container, cmd, (chunk) => {
-      sendEvent("task.output", { task_id: taskId, agent_name: agent_name || "default", text: chunk });
+    const { text: fullOutput } = await parseClaudeStream(container, cmd, (evt) => {
+      if (evt.type === "text") sendEvent("task.output", { task_id: taskId, agent_name: agent_name || "default", text: evt.text });
+      else if (evt.type === "tool_use") sendEvent("task.tool_use", { task_id: taskId, agent_name: agent_name || "default", tool: evt.name, input: evt.input });
+      else if (evt.type === "tool_result") sendEvent("task.tool_result", { task_id: taskId, agent_name: agent_name || "default", output: evt.output });
     });
 
     group.tasks_completed++;
@@ -536,42 +562,51 @@ These are YOUR agents. They run in the same container as you and have all the to
 
 5. **NEVER refuse a schedule because of "minimum interval"** — there is NO minimum interval in the Agentsfy scheduler. Cron like */5 * * * * works fine.
 
-## RESPONSE FORMAT
+## RESPONSE STYLE — BE BRIEF
 
-First, briefly explain your plan (1-2 sentences).
+You are having a conversation with the user. Talk like a team lead updating a chat, NOT writing a report.
 
-Then delegate:
+- **ONE sentence plans.** "Vou pedir pro Web Researcher buscar as notícias, depois o Bitrix envia pro Lucas."
+- **ONE line status updates.** "Web Researcher pronto — 8 notícias encontradas."
+- **NO giant markdown tables, NO long bullet lists, NO emoji headers, NO "## Follow-up necessário".**
+- **NO repeating agent output** — the user already saw what the agent said. Just confirm outcome.
+- If something failed, say what and suggest ONE fix, in one line.
+- Max 3 sentences per message.
+
+## OUTPUT BLOCKS
+
+Delegate (when needed):
 DELEGATE:
-[{"agent_name": "exact-member-name", "task": "detailed actionable task"}]
+[{"agent_name": "exact-member-name", "task": "what to do, with file paths and specifics"}]
 END_DELEGATE
 
-If the user asks for something recurring:
+Schedule recurring tasks:
 SCHEDULE:
-{"cron": "*/5 * * * *", "name": "Descriptive name", "prompt": "What should happen each run"}
+{"cron": "*/5 * * * *", "name": "Name", "prompt": "what to do each run"}
 END_SCHEDULE
 
-## CRON EXAMPLES
-- */5 * * * * → every 5 minutes (WORKS — no minimum interval restriction)
-- */10 * * * * → every 10 minutes
-- 0 * * * * → every hour
-- 0 9 * * * → daily at 9am
+Cron examples: */5 * * * * (5 min), 0 * * * * (hourly), 0 9 * * * (daily 9am).
 
-## IF USER ASKS FOR SCHEDULE
-
-Just output the SCHEDULE block. A brief plain-language confirmation is fine ("Configurei a tarefa recorrente"). Do NOT list bloqueios, MCP connectors, or alternative options. The schedule executes via the local Agentsfy scheduler, which runs your agents inside this container. The Bitrix Agent IS in this team — it will be called when the schedule fires.
+For schedules: just output the block + ONE sentence "Agendei X a cada Y". Nothing else.
 
 ${context ? "\nCONVERSATION CONTEXT:\n" + context : ""}
 ${memoryContext}`;
 
     sendEvent("orchestrate.started", { group_id: group.id, prompt });
 
-    // Step 1: Ask orchestrator to plan
+    // Step 1: Ask orchestrator to plan (stream-json)
     const planCmd = buildClaudeCmd(prompt, orchestratorPrompt, {});
-    const plan = await containerExecStreamWithRetry(container, planCmd, (chunk) => {
-      sendEvent("orchestrate.planning", { text: chunk });
+    const { text: plan } = await parseClaudeStream(container, planCmd, (evt) => {
+      if (evt.type === "text") {
+        sendEvent("orchestrate.planning", { text: evt.text });
+      } else if (evt.type === "tool_use") {
+        sendEvent("agent.tool_use", { sender: "Orchestrator", tool: evt.name, input: evt.input });
+      } else if (evt.type === "tool_result") {
+        sendEvent("agent.tool_result", { sender: "Orchestrator", output: evt.output });
+      }
     });
 
-    sendEvent("orchestrate.plan_ready", { plan: plan.trim() });
+    sendEvent("orchestrate.plan_ready", { plan: (plan || "").trim() });
 
     // Step 2: Parse delegations
     const delegateMatch = plan.match(/DELEGATE:\s*\n?\s*(\[[\s\S]*?\])\s*\n?\s*END_DELEGATE/);
@@ -602,8 +637,14 @@ ${memoryContext}`;
             allowedTools: ["Bash", "Write", "Edit", "Read"],
           });
 
-          const output = await containerExecStreamWithRetry(container, taskCmd, (chunk) => {
-            sendEvent("agent.output", { agent_name: d.agent_name, text: chunk });
+          const { text: output } = await parseClaudeStream(container, taskCmd, (evt) => {
+            if (evt.type === "text") {
+              sendEvent("agent.output", { agent_name: d.agent_name, text: evt.text });
+            } else if (evt.type === "tool_use") {
+              sendEvent("agent.tool_use", { agent_name: d.agent_name, tool: evt.name, input: evt.input });
+            } else if (evt.type === "tool_result") {
+              sendEvent("agent.tool_result", { agent_name: d.agent_name, output: evt.output });
+            }
           });
 
           // Auto-save agent + group memories
@@ -623,20 +664,20 @@ ${memoryContext}`;
 
     // Step 4: Synthesize results
     if (results.length > 0) {
-      const synthesisPrompt = "The team has completed their tasks. Here are the results:\n\n" +
-        results.map(r => "## " + r.agent_name + "\n" + r.output).join("\n\n") +
-        "\n\nSummarize what was accomplished, list any URLs or deliverables, and note if anything needs follow-up.";
+      const synthesisPrompt = "Team finished. Results:\n\n" +
+        results.map(r => "[" + r.agent_name + "] " + r.output.slice(0, 1500)).join("\n\n") +
+        "\n\nIn 1-2 sentences, tell the user what got done. Include any live URLs. DO NOT make lists, tables, or re-paste agent output.";
 
-      const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Synthesize team results concisely. Include all URLs and deliverables.", {});
+      const synthesisCmd = buildClaudeCmd(synthesisPrompt, "You are the Orchestrator. Reply in 1-2 sentences max. No markdown tables, no bullet lists, no headings. Just what happened.", {});
 
-      const synthesis = await containerExecStreamWithRetry(container, synthesisCmd, (chunk) => {
-        sendEvent("orchestrate.synthesis", { text: chunk });
+      const { text: synthesis } = await parseClaudeStream(container, synthesisCmd, (evt) => {
+        if (evt.type === "text") sendEvent("orchestrate.synthesis", { text: evt.text });
       });
 
-      sendEvent("orchestrate.completed", { synthesis: synthesis.trim(), results });
+      sendEvent("orchestrate.completed", { synthesis: (synthesis || "").trim(), results });
     } else {
       // No delegation — orchestrator answered directly
-      sendEvent("orchestrate.completed", { synthesis: plan.trim(), results: [] });
+      sendEvent("orchestrate.completed", { synthesis: (plan || "").trim(), results: [] });
     }
 
     // Step 5: Check for schedules
