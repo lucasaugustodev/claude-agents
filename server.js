@@ -191,21 +191,49 @@ async function injectCredentials(container) {
 // --- Build publish instructions ---
 function buildPublishInstructions(groupId, agentPort, subdomain) {
   const hostIp = getHostIp();
+  const containerName = GROUP_PREFIX + groupId;
   return `
-IMPORTANT - Publishing & Deploy capabilities:
-You have THREE ways to make your work accessible externally:
 
-1. STATIC FILES: Save to /publish/ -> auto-served at http://${hostIp}:${PORT}/sites/${groupId}/
+=== AGENTSFY DEPLOY SYSTEM ===
 
-2. DYNAMIC APPS: Start server on port ${agentPort} -> http://${hostIp}:${agentPort}/
+You are inside a Docker container named "${containerName}" that is part of the Agentsfy platform.
+All agents in this group share the /workspace filesystem and /publish directory.
+Your dedicated port is ${agentPort}.
 
-3. PRODUCTION DEPLOY (PREFERRED):
-   Subdomain: https://${subdomain}.${DOMAIN}
-   For static: npm install -g serve && serve /publish -l ${agentPort} -s &
-   Then register: curl -s -X POST http://127.0.0.1:9090/subdomains -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" -d '{"subdomain":"${subdomain}","container_name":"${GROUP_PREFIX}${groupId}","port":${agentPort},"ip":"127.0.0.1"}'
-   Live at: https://${subdomain}.${DOMAIN}
+WHEN YOU BUILD AN APP OR WEBSITE, YOU MUST FOLLOW THIS FULL DEPLOY PROCESS:
 
-When deploying, ALWAYS tell the user the production URL. All agents in this group share the /workspace filesystem.
+STEP 1 - Build your app
+  Save files to /publish/ for static sites, or create a server in /workspace.
+
+STEP 2 - Start serving
+  For static sites:
+    npm install -g serve 2>/dev/null; serve /publish -l ${agentPort} -s &
+  For Node.js apps:
+    Start your server listening on port ${agentPort}
+
+STEP 3 - Register the app (MANDATORY)
+  This makes the app appear on the user's Apps page in Agentsfy:
+    curl -s -X POST http://127.0.0.1:9090/containers/${containerName}/apps \\
+      -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" \\
+      -d '{"app_name":"${subdomain}","port":${agentPort},"command":"serve /publish -l ${agentPort} -s"}'
+
+STEP 4 - Register subdomain (MANDATORY)
+  This gives the app a production HTTPS URL:
+    curl -s -X POST http://127.0.0.1:9090/subdomains \\
+      -H "Content-Type: application/json" -H "x-api-key: ${CLOUD_API_SECRET}" \\
+      -d '{"subdomain":"${subdomain}","container_name":"${containerName}","port":${agentPort},"ip":"127.0.0.1"}'
+
+STEP 5 - Confirm to the user
+  Production URL: https://${subdomain}.${DOMAIN}
+  ALWAYS tell the user this URL after deploying.
+
+IMPORTANT RULES:
+- NEVER skip steps 3 and 4. Without them the app won't appear in the platform.
+- If the user asks to "deploy", "publish", or "put online", follow ALL 5 steps.
+- Use /workspace/shared/ for files that other agents in this group need to access.
+- Your personal workspace is /workspace/<your-name> but you can read/write anywhere in /workspace.
+
+=== END DEPLOY SYSTEM ===
 `;
 }
 
