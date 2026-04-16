@@ -1,0 +1,15 @@
+{
+  "name": "claude-agents",
+  "version": "1.0.0",
+  "description": "Claude Code Managed Agents - Docker-based agent orchestration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dockerode": "^4.0.4",
+    "express": "^4.21.0",
+    "uuid": "^11.1.0",
+    "cors": "^2.8.5"
+  }
+}
